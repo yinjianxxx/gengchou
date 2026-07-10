@@ -1,3 +1,7 @@
+**English** | [简体中文](README.zh-CN.md)
+
+<!-- Keep user-facing behavior, installation, privacy, and release status aligned with README.zh-CN.md. -->
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![CI](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
@@ -51,7 +55,7 @@ the release `SHA256SUMS` file.
 
 ### WinGet
 
-The first WinGet package is under review in
+The first WinGet package has passed validation and is awaiting maintainer review in
 [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
 After Microsoft accepts the submission and the community catalog synchronises:
 

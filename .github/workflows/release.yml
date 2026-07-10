@@ -62,13 +62,15 @@ jobs:
           Copy-Item -LiteralPath THIRD_PARTY_NOTICES.md -Destination dist\THIRD_PARTY_NOTICES.md
           Copy-Item -LiteralPath DEPENDENCY_LICENSES.md -Destination dist\DEPENDENCY_LICENSES.md
           Copy-Item -LiteralPath README.md -Destination dist\README.md
+          Copy-Item -LiteralPath README.zh-CN.md -Destination dist\README.zh-CN.md
 
           $bundleFiles = @(
             "dist\ai-usage-monitor.exe",
             "dist\LICENSE",
             "dist\THIRD_PARTY_NOTICES.md",
             "dist\DEPENDENCY_LICENSES.md",
-            "dist\README.md"
+            "dist\README.md",
+            "dist\README.zh-CN.md"
           )
           Compress-Archive -LiteralPath $bundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
 
@@ -100,6 +102,6 @@ jobs:
             dist/DEPENDENCY_LICENSES.md `
             dist/SHA256SUMS `
             --verify-tag `
-            --title "AI Usage Monitor $env:GITHUB_REF_NAME - First Public Fork Release" `
-            --notes "First public release of the stability-focused fork based on CodeZeno v1.4.8. See README.md and FORK-NOTES.md for details."
+            --title "AI Usage Monitor $env:GITHUB_REF_NAME" `
+            --notes "Release of the stability-focused fork based on CodeZeno v1.4.8. See README.md, README.zh-CN.md, and FORK-NOTES.md for details."
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
