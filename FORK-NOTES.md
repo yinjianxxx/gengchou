@@ -23,6 +23,7 @@ or permanently losing the embedded widget.
 | Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\AIUsageMonitor |
 | Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\AIUsageMonitor\diagnose.log |
 | Updates | Upstream GitHub Releases | This fork's GitHub Releases and independent EXE asset |
+| Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\AIUsageMonitor\updates |
 
 ## Stability changes
 
@@ -31,6 +32,7 @@ or permanently losing the embedded widget.
 3. Register WTS session notifications and suspend recovery activity during lock, disconnect, and unstable RDP transitions.
 4. Retry relaunch and mutex hand-off, retaining process restart only as a final fallback after repeated in-process recovery failures.
 5. Enable append-only rotating diagnostics with readable local timestamps and process IDs.
+6. Verify self-update downloads against the release `SHA256SUMS` manifest before replacing the executable.
 
 ## Position anchoring
 

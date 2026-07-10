@@ -14,6 +14,9 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const RELEASE_ASSET_NAME: &str = "ai-usage-monitor.exe";
+// Fixed asset produced by .github/workflows/release.yml; self-updates refuse
+// to apply a download whose SHA-256 does not match this manifest.
+const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -31,6 +34,7 @@ pub enum InstallChannel {
 pub struct ReleaseDescriptor {
     pub latest_version: String,
     asset_url: String,
+    checksums_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -135,6 +139,10 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     }
 
     download_release_asset(&release.asset_url, &partial_download_path, &download_path)?;
+    if let Err(error) = verify_download_checksum(release, &download_path) {
+        let _ = std::fs::remove_file(&download_path);
+        return Err(error);
+    }
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -209,9 +217,16 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
             "No Windows executable asset was found in the latest release.".to_string()
         })?;
 
+    let checksums_url = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(CHECKSUMS_ASSET_NAME))
+        .map(|asset| asset.browser_download_url.clone());
+
     Ok(Some(ReleaseDescriptor {
         latest_version,
         asset_url: asset.browser_download_url.clone(),
+        checksums_url,
     }))
 }
 
@@ -245,6 +260,97 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
 
     Ok(())
+}
+
+/// Compare the downloaded binary against the release's SHA256SUMS manifest.
+/// Release checks tolerate a missing manifest (the user can still see an
+/// update exists), but applying one without a verifiable hash is refused.
+fn verify_download_checksum(release: &ReleaseDescriptor, download: &Path) -> Result<(), String> {
+    let checksums_url = release.checksums_url.as_deref().ok_or_else(|| {
+        format!(
+            "The release does not provide a {CHECKSUMS_ASSET_NAME} file; refusing to apply an unverified update. Download it manually from the GitHub release page."
+        )
+    })?;
+
+    let agent = build_agent()?;
+    let manifest = agent
+        .get(checksums_url)
+        .set("User-Agent", user_agent())
+        .call()
+        .map_err(|e| format!("Unable to download the release {CHECKSUMS_ASSET_NAME} file: {e}"))?
+        .into_string()
+        .map_err(|e| format!("Unable to read the release {CHECKSUMS_ASSET_NAME} file: {e}"))?;
+
+    let expected = expected_checksum_from_manifest(&manifest, RELEASE_ASSET_NAME).ok_or_else(
+        || format!("{CHECKSUMS_ASSET_NAME} has no entry for {RELEASE_ASSET_NAME}; refusing to apply an unverified update."),
+    )?;
+
+    let actual = sha256_file_hex(download)?;
+    if actual.eq_ignore_ascii_case(&expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The downloaded update failed SHA-256 verification (expected {expected}, got {actual}). The download may be corrupted or tampered with."
+        ))
+    }
+}
+
+/// Parse `<hex>  <name>` manifest lines (the format release.yml writes).
+fn expected_checksum_from_manifest(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?;
+        (name.eq_ignore_ascii_case(asset_name) && hash.len() == 64)
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, String> {
+    let contents =
+        std::fs::read(path).map_err(|e| format!("Unable to read the downloaded update: {e}"))?;
+    sha256_hex(&contents)
+}
+
+/// SHA-256 via the Windows CNG provider: no extra hashing crate needed.
+fn sha256_hex(data: &[u8]) -> Result<String, String> {
+    use windows::Win32::Security::Cryptography::{
+        BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
+        BCryptHashData, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE,
+        BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS, BCRYPT_SHA256_ALGORITHM,
+    };
+
+    unsafe {
+        let mut algorithm = BCRYPT_ALG_HANDLE::default();
+        if BCryptOpenAlgorithmProvider(
+            &mut algorithm,
+            BCRYPT_SHA256_ALGORITHM,
+            None,
+            BCRYPT_OPEN_ALGORITHM_PROVIDER_FLAGS(0),
+        )
+        .is_err()
+        {
+            return Err("Unable to initialize SHA-256 for update verification.".to_string());
+        }
+
+        let mut hash = BCRYPT_HASH_HANDLE::default();
+        let mut digest = [0u8; 32];
+        let result = if BCryptCreateHash(algorithm, &mut hash, None, None, 0).is_err() {
+            Err("Unable to initialize SHA-256 for update verification.".to_string())
+        } else {
+            let hashed = if BCryptHashData(hash, data, 0).is_err()
+                || BCryptFinishHash(hash, &mut digest, 0).is_err()
+            {
+                Err("Unable to compute the update's SHA-256 hash.".to_string())
+            } else {
+                Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+            };
+            let _ = BCryptDestroyHash(hash);
+            hashed
+        };
+        let _ = BCryptCloseAlgorithmProvider(algorithm, 0);
+        result
+    }
 }
 
 fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
@@ -337,15 +443,12 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
 }
 
 fn updates_dir() -> Result<PathBuf, String> {
+    // AIUsageMonitor, not the upstream ClaudeCodeUsageMonitor: the staging
+    // file names are fixed, so sharing the upstream directory would let two
+    // side-by-side apps overwrite each other's pending update.
     dirs::data_local_dir()
-        .map(|dir| dir.join("ClaudeCodeUsageMonitor").join("updates"))
-        .or_else(|| {
-            Some(
-                std::env::temp_dir()
-                    .join("ClaudeCodeUsageMonitor")
-                    .join("updates"),
-            )
-        })
+        .map(|dir| dir.join("AIUsageMonitor").join("updates"))
+        .or_else(|| Some(std::env::temp_dir().join("AIUsageMonitor").join("updates")))
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
@@ -397,7 +500,7 @@ fn ensure_target_location_writable(target: &Path) -> Result<(), String> {
         "Unable to determine the install directory for the current executable.".to_string()
     })?;
 
-    let probe_path = parent.join(".__ccum_update_probe");
+    let probe_path = parent.join(".__aium_update_probe");
     match File::create(&probe_path) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe_path);
@@ -512,4 +615,56 @@ fn show_error_message(title: &str, message: &str) {
 
 fn wide_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_lookup_finds_the_exe_entry() {
+        let manifest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ai-usage-monitor.exe\n\
+                        fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  ai-usage-monitor-windows-x64.zip\n";
+        assert_eq!(
+            expected_checksum_from_manifest(manifest, RELEASE_ASSET_NAME).as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn manifest_lookup_rejects_missing_or_malformed_entries() {
+        assert_eq!(
+            expected_checksum_from_manifest("", RELEASE_ASSET_NAME),
+            None
+        );
+        // Wrong asset name.
+        assert_eq!(
+            expected_checksum_from_manifest(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  other.exe",
+                RELEASE_ASSET_NAME
+            ),
+            None
+        );
+        // Truncated hash.
+        assert_eq!(
+            expected_checksum_from_manifest("abc123  ai-usage-monitor.exe", RELEASE_ASSET_NAME),
+            None
+        );
+    }
+
+    #[test]
+    fn sha256_matches_known_vector() {
+        // SHA-256("abc"), the FIPS 180-2 test vector.
+        assert_eq!(
+            sha256_hex(b"abc").expect("hashing should succeed"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn version_comparison_ignores_prerelease_suffix() {
+        assert!(is_version_newer("2.1.0", "2.0.0"));
+        assert!(!is_version_newer("1.9.9", "2.0.0"));
+        assert!(!is_version_newer("2.0.0", "2.0.0"));
+    }
 }
