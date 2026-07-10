@@ -10,7 +10,19 @@
 > v1.4.8 (commit `9b29972`). It uses a separate executable name, mutex, window
 > class, settings directory, log directory, and GitHub release channel.
 
+## Screenshots
+
+### Detail popup
+
 ![AI Usage Monitor detail popup](.github/screenshot.png)
+
+### Taskbar widget and provider tray icons
+
+| Taskbar widget | Provider tray icons |
+| --- | --- |
+| ![AI Usage Monitor embedded taskbar widget](.github/taskbar-widget.png) | <img src=".github/tray-icons.png" alt="AI Usage Monitor Claude Code and Codex tray icons" width="160"> |
+
+Captured from a running Windows 11 session and cropped to AI Usage Monitor only.
 
 AI Usage Monitor is a lightweight native Windows taskbar widget and system-tray
 app for viewing Claude Code, Codex, and Google Antigravity usage windows without
@@ -34,11 +46,21 @@ opening a provider dashboard.
 Download `ai-usage-monitor.exe` from the
 [latest GitHub Release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest).
 The first public release is portable: place the EXE in a user-writable directory
-and run it.
+and run it. The v2.0.0 executable is currently unsigned; verify downloads against
+the release `SHA256SUMS` file.
 
-> There is no WinGet package for this fork yet.
-> `winget install CodeZeno.ClaudeCodeUsageMonitor` installs the upstream
-> CodeZeno application, not AI Usage Monitor.
+### WinGet
+
+The first WinGet package is under review in
+[microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
+After Microsoft accepts the submission and the community catalog synchronises:
+
+```powershell
+winget install --id yinjianxxx.AIUsageMonitor --exact
+```
+
+`winget install CodeZeno.ClaudeCodeUsageMonitor` installs the upstream CodeZeno
+application, not AI Usage Monitor.
 
 ### Build from source
 
