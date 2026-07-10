@@ -2,193 +2,144 @@
 
 <!-- Keep user-facing behavior, installation, privacy, and release status aligned with README.zh-CN.md. -->
 
+<div align="center">
+
+# AI Usage Monitor
+
+**Claude Code · Codex · Antigravity usage, right on the Windows taskbar.**
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![CI](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-# AI Usage Monitor
+<img src=".github/screenshot.png" alt="Detail popup showing Claude Code and Codex usage bars with reset times" width="500">
 
-> **Independent stability-focused community fork.** This project is based on
-> [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
-> v1.4.8 (commit `9b29972`). It uses a separate executable name, mutex, window
-> class, settings directory, log directory, and GitHub release channel.
+<br>
 
-## Screenshots
+<img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in the Windows taskbar">
 
-### Detail popup
+<sub>Real Windows 11 captures: the detail popup (top) and the embedded taskbar widget (bottom).</sub>
 
-![AI Usage Monitor detail popup](.github/screenshot.png)
+</div>
 
-### Taskbar widget and provider tray icons
+AI Usage Monitor is a lightweight native Windows app that keeps your current
+5-hour and 7-day usage windows visible at a glance — as a taskbar widget and
+one tray icon per provider — so you never open a dashboard just to check
+quota. It is an independent, stability-focused fork of
+[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
+([fork notes](FORK-NOTES.md)).
 
-| Taskbar widget | Provider tray icons |
-| --- | --- |
-| ![AI Usage Monitor embedded taskbar widget](.github/taskbar-widget.png) | <img src=".github/tray-icons.png" alt="AI Usage Monitor Claude Code and Codex tray icons" width="160"> |
-
-Captured from a running Windows 11 session and cropped to AI Usage Monitor only.
-
-AI Usage Monitor is a lightweight native Windows taskbar widget and system-tray
-app for viewing Claude Code, Codex, and Google Antigravity usage windows without
-opening a provider dashboard.
-
-## Features
-
-- Current 5-hour and 7-day usage with reset countdowns
-- Optional Claude Code, Codex, and Antigravity providers
-- One tray icon per enabled provider, with percentage and two compact usage bars
-- A theme-aware detail popup with provider status, relative and absolute reset times
-- Reset notifications that are disabled by default
-- Multi-monitor taskbar placement using a taskbar-relative saved anchor
-- Recovery after explorer.exe taskbar rebuilds and RDP session changes
-- Append-only rotating diagnostics with local timestamps and process IDs
-- English, Simplified Chinese, Traditional Chinese, and other upstream localizations
-- No analytics, telemetry, backend service, or model-generation probes
-
-## Download
+## Install
 
 Download `ai-usage-monitor.exe` from the
-[latest GitHub Release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest).
-The first public release is portable: place the EXE in a user-writable directory
-and run it. The v2.0.0 executable is currently unsigned; verify downloads against
-the release `SHA256SUMS` file.
+[latest release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest),
+put it in any user-writable folder, and run it — no installer. The binary is
+currently unsigned; verify it against the release's `SHA256SUMS` if you wish
+(in-app updates check it automatically).
 
-### WinGet
-
-The first WinGet package has passed validation and is awaiting maintainer review in
-[microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
-After Microsoft accepts the submission and the community catalog synchronises:
+Once [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395)
+is merged, WinGet will also work (not to be confused with the upstream
+package `CodeZeno.ClaudeCodeUsageMonitor`):
 
 ```powershell
 winget install --id yinjianxxx.AIUsageMonitor --exact
 ```
 
-`winget install CodeZeno.ClaudeCodeUsageMonitor` installs the upstream CodeZeno
-application, not AI Usage Monitor.
-
-### Build from source
-
-Requirements:
-
-- Windows 10 or Windows 11
-- Stable Rust toolchain
+<details>
+<summary><b>Build from source</b> (Windows 10/11, stable Rust)</summary>
 
 ```powershell
 git clone https://github.com/yinjianxxx/ai-usage-monitor.git
 cd ai-usage-monitor
-cargo test --locked
 cargo build --release --locked
 .\target\release\ai-usage-monitor.exe
 ```
 
-## Requirements and account access
+</details>
 
-- Claude Code must already be installed and authenticated to display Claude usage.
-- Codex support requires an existing authenticated Codex CLI or app session.
-- Antigravity support requires an existing authenticated Antigravity session.
-- WSL Claude Code credentials are supported when a usable WSL distribution is available.
+## Features
 
-The monitor does not create provider accounts or bypass provider authentication.
-Availability follows each provider's own account and service rules.
+- Live 5-hour and 7-day usage with reset countdowns
+- Claude Code, Codex, and Google Antigravity — enable any combination
+- One compact tray icon per provider: usage number plus 5h / 7d bars
+- Theme-aware detail popup with per-provider status and exact reset times
+- Optional reset notifications (off by default)
+- Survives `explorer.exe` restarts and RDP / lock-screen transitions
+- Multi-monitor and multi-taskbar aware
+- 11 languages · no telemetry · a single ~1 MB portable executable
 
-## Use
+## Usage
 
-- Drag the left divider to move the taskbar widget.
-- Drag the widget to another taskbar to change monitors.
-- Left-click a tray icon or the widget body to open or close the detail popup.
-- Right-click the widget or a tray icon for provider selection, refresh interval,
-  notifications, startup, position, language, update checks, widget visibility,
+- **Left-click** the widget or a tray icon to open or close the detail popup.
+- **Right-click** for the menu: providers, refresh interval, notifications,
+  start with Windows, position, language, update checks, widget visibility,
   and exit.
-- Enable **Start with Windows** from the context menu if desired.
+- **Drag** the widget by its left divider to reposition it; drop it on
+  another taskbar to change monitors.
 
 ### Tray icons
 
-Each enabled provider receives one frameless tray icon. The number shows current
-5-hour usage; the upper and lower bars show the 5-hour and 7-day windows.
-While usage is unavailable, the number is replaced with a provider initial.
-Near a usage limit, the indicator switches to a warning colour.
+<img src=".github/tray-icons.png" alt="Claude Code, Codex, and Antigravity tray icons">
 
-For an offline icon preview:
+The number is the current 5-hour usage; the bars underneath show the 5-hour
+(upper) and 7-day (lower) windows. While no data is available the number
+gives way to a provider initial, and near a limit it switches to a warning
+colour. The preview above is rendered by the app itself —
+`.\ai-usage-monitor.exe --dump-tray-icons .\preview` exports every state.
 
-```powershell
-.\ai-usage-monitor.exe --dump-tray-icons .\tray-icon-preview
-```
+## Requirements
 
-## Stability fork behaviour
+The monitor only reads your existing local sessions — it never creates
+accounts or bypasses provider authentication, and what it can show follows
+each provider's own account rules:
 
-The fork adds recovery paths for conditions that could terminate or permanently
-hide the upstream taskbar widget:
+- **Claude Code** — installed and signed in (WSL credentials are picked up
+  when a usable distribution exists)
+- **Codex** — a signed-in Codex CLI or app session
+- **Antigravity** — a signed-in Antigravity session
 
-- External `WM_DESTROY` events trigger in-process recreation instead of immediate exit.
-- WTS session notifications pause recovery work during lock and RDP transitions.
-- Taskbar geometry is allowed to stabilise before the widget is reattached.
-- Panic hooks and FFI panic boundaries record failures instead of aborting silently.
-- Relaunch is retained as a final fallback after repeated in-process recovery failures.
+## Data & privacy
 
-See [FORK-NOTES.md](FORK-NOTES.md) for the technical summary.
+| What | Where |
+| --- | --- |
+| Settings | `%APPDATA%\AIUsageMonitor\settings.json` |
+| Usage cache — percentages and reset times only, never tokens | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
+| Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\AIUsageMonitor\diagnose.log` |
 
-## Local data and diagnostics
+Network traffic goes directly to the enabled providers (Anthropic,
+ChatGPT/Codex, Google) for read-only usage queries, plus GitHub for update
+checks and user-approved update downloads. The app never:
 
-Settings:
+- collects analytics or telemetry, or uploads any files;
+- sends credentials anywhere except the provider that issued them;
+- modifies your credentials;
+- triggers model generation — no `claude -p`, `codex exec`, or calls to
+  `/v1/messages`, `/v1/chat/completions`, and similar endpoints.
 
-```text
-%APPDATA%\AIUsageMonitor\settings.json
-```
+Provider bearer tokens travel inside each TLS request, so only configure
+proxies you trust.
 
-Cached percentages and reset times:
+## Stability fork
 
-```text
-%APPDATA%\AIUsageMonitor\usage-cache.json
-```
+This fork exists to keep the widget alive through what used to kill it:
+external `WM_DESTROY`, `explorer.exe` taskbar rebuilds, and RDP session
+switches now trigger in-process recovery, with relaunch kept only as a last
+resort, and panics are logged instead of silently ending the process. See
+[FORK-NOTES.md](FORK-NOTES.md) for the technical summary.
 
-Diagnostics:
+## Acknowledgements & license
 
-```text
-%LOCALAPPDATA%\AIUsageMonitor\diagnose.log
-%LOCALAPPDATA%\AIUsageMonitor\diagnose.log.old
-```
-
-The usage cache contains percentages and reset timestamps only. It does not
-persist OAuth tokens or raw provider responses.
-
-## Privacy and network behaviour
-
-The app reads existing local provider credentials only to authenticate read-only
-usage requests. Depending on enabled providers, it connects directly to Anthropic,
-ChatGPT/Codex, and Google Cloud Code or Antigravity endpoints.
-
-It also connects to GitHub when checking this fork's Releases for an update.
-Portable builds can download `ai-usage-monitor.exe` from this repository when
-the user accepts an available update.
-
-The app:
-
-- does not collect analytics or telemetry;
-- does not upload project files;
-- does not send credentials to a separate backend;
-- does not edit Codex credentials;
-- does not run `claude -p`, `codex exec`, or other model-capable refresh probes;
-- does not call generation endpoints such as `/v1/messages`,
-  `/v1/chat/completions`, `/v1/responses`, or `/v1/completions`.
-
-Trusted proxy configuration is important because provider bearer tokens remain
-inside each proxied TLS request.
-
-## Acknowledgements and independence
-
-AI Usage Monitor is derived from
-[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
-based on v1.4.8 (commit `9b29972`). The tray-icon presentation and parts of
-Claude usage polling, caching, cooldown, and rate-limit handling were adapted
-from or informed by
+Derived from
+[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
+v1.4.8 (commit `9b29972`). The tray-icon presentation and parts of the Claude
+usage polling, caching, cooldown, and rate-limit handling were adapted from or
+informed by
 [jens-duttke/usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude).
-
 This project is not affiliated with, endorsed by, or sponsored by Code Zeno
-Pty Ltd, Anthropic, OpenAI, or Google. Product and company names are used only
-to describe compatibility; all trademarks belong to their respective owners.
+Pty Ltd, Anthropic, OpenAI, or Google; product names are used only to describe
+compatibility, and all trademarks belong to their respective owners.
 
-## License
-
-This project is distributed under the MIT License. See [LICENSE](LICENSE),
+MIT License — see [LICENSE](LICENSE),
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), and
 [DEPENDENCY_LICENSES.md](DEPENDENCY_LICENSES.md) for retained notices.
