@@ -26,3 +26,15 @@ AGENTS.md
 
 # Local WinGet manifest generation output
 /manifests/
+
+# Local build deliverables (copied from target/release)
+/outputs/
+
+# Local packaging and runtime verification
+/output/
+/runtime_verify/
+
+# Local agent configuration
+/.agents/
+/.claude/
+/.codex/

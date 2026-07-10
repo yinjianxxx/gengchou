@@ -1,7 +1,30 @@
-MIT License
+# Third-Party Notices
+
+AI Usage Monitor contains modified material from, or was informed by, the
+following open-source projects.
+
+## CodeZeno/Claude-Code-Usage-Monitor
+
+- Source: https://github.com/CodeZeno/Claude-Code-Usage-Monitor
+- Baseline: v1.4.8, commit `9b29972`
 
 Copyright (c) 2025 Craig Constable
-Copyright (c) 2026 yinjianxxx (modifications)
+
+The original copyright notice and complete MIT License are preserved in
+[LICENSE](LICENSE). The application icon and the original taskbar-widget code
+originate from this project.
+
+## jens-duttke/usage-monitor-for-claude
+
+- Source: https://github.com/jens-duttke/usage-monitor-for-claude
+
+Elements of the tray-icon presentation and Claude OAuth usage polling,
+caching, cooldown, and HTTP 429 handling were adapted from or informed by
+this project.
+
+MIT License
+
+Copyright (c) 2026 Jens Duttke
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

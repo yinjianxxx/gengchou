@@ -134,6 +134,19 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     }
 }
 
+/// Undo `embed_in_taskbar`: turn the window back into a top-level popup.
+/// Used when a surviving window must fall back to popup mode because no
+/// taskbar is available to host it (e.g. after an RDP session switch).
+pub fn detach_to_popup(hwnd: HWND) {
+    unsafe {
+        // Clear WS_CHILD before re-parenting to the desktop, per SetParent docs.
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        let new_style = (style & !WS_CHILD_STYLE) | WS_POPUP_STYLE;
+        let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
+        let _ = SetParent(hwnd, HWND::default());
+    }
+}
+
 /// Move the window
 pub fn move_window(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     unsafe {

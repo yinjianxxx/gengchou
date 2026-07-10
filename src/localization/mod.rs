@@ -6,6 +6,7 @@ mod japanese;
 mod korean;
 mod portuguese_brazil;
 mod russian;
+mod simplified_chinese;
 mod spanish;
 mod traditional_chinese;
 
@@ -24,13 +25,14 @@ pub enum LanguageId {
     German,
     Japanese,
     Korean,
+    SimplifiedChinese,
     TraditionalChinese,
     Russian,
     PortugueseBrazil,
 }
 
 impl LanguageId {
-    pub const ALL: [LanguageId; 10] = [
+    pub const ALL: [LanguageId; 11] = [
         LanguageId::English,
         LanguageId::Dutch,
         LanguageId::Spanish,
@@ -38,6 +40,7 @@ impl LanguageId {
         LanguageId::German,
         LanguageId::Japanese,
         LanguageId::Korean,
+        LanguageId::SimplifiedChinese,
         LanguageId::TraditionalChinese,
         LanguageId::Russian,
         LanguageId::PortugueseBrazil,
@@ -52,12 +55,12 @@ impl LanguageId {
             Self::German => "de",
             Self::Japanese => "ja",
             Self::Korean => "ko",
+            Self::SimplifiedChinese => "zh-CN",
             Self::TraditionalChinese => "zh-TW",
             Self::Russian => "ru",
             Self::PortugueseBrazil => "pt-BR",
         }
     }
-
     pub fn native_name(self) -> &'static str {
         match self {
             Self::English => "English",
@@ -67,12 +70,12 @@ impl LanguageId {
             Self::German => "Deutsch",
             Self::Japanese => "日本語",
             Self::Korean => "한국어",
+            Self::SimplifiedChinese => "简体中文",
             Self::TraditionalChinese => "繁體中文",
             Self::Russian => "Русский",
             Self::PortugueseBrazil => "Português (Brasil)",
         }
     }
-
     pub fn strings(self) -> Strings {
         match self {
             Self::English => english::STRINGS,
@@ -82,6 +85,7 @@ impl LanguageId {
             Self::German => german::STRINGS,
             Self::Japanese => japanese::STRINGS,
             Self::Korean => korean::STRINGS,
+            Self::SimplifiedChinese => simplified_chinese::STRINGS,
             Self::TraditionalChinese => traditional_chinese::STRINGS,
             Self::Russian => russian::STRINGS,
             Self::PortugueseBrazil => portuguese_brazil::STRINGS,
@@ -97,6 +101,7 @@ impl LanguageId {
             Self::German => german::UPDATE_VIA_WINGET_LABEL,
             Self::Japanese => japanese::UPDATE_VIA_WINGET_LABEL,
             Self::Korean => korean::UPDATE_VIA_WINGET_LABEL,
+            Self::SimplifiedChinese => simplified_chinese::UPDATE_VIA_WINGET_LABEL,
             Self::TraditionalChinese => traditional_chinese::UPDATE_VIA_WINGET_LABEL,
             Self::Russian => russian::UPDATE_VIA_WINGET_LABEL,
             Self::PortugueseBrazil => portuguese_brazil::UPDATE_VIA_WINGET_LABEL,
@@ -125,7 +130,7 @@ impl LanguageId {
                 {
                     Some(Self::TraditionalChinese)
                 } else {
-                    None
+                    Some(Self::SimplifiedChinese)
                 }
             }
             "ru" => Some(Self::Russian),
@@ -166,6 +171,11 @@ pub struct Strings {
     pub update_prompt_now: &'static str,
     pub exit: &'static str,
     pub show_widget: &'static str,
+    pub notifications: &'static str,
+    pub notify_session_reset: &'static str,
+    pub notify_weekly_reset: &'static str,
+    pub reset_notification_title: &'static str,
+    pub reset_notification_body: &'static str,
     pub session_window: &'static str,
     pub weekly_window: &'static str,
     pub now: &'static str,
@@ -181,6 +191,27 @@ pub struct Strings {
     pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,
     pub antigravity_window_title: &'static str,
+    // Detail popup (tray left-click) strings.
+    pub detail_waiting: &'static str,
+    pub detail_auth_required: &'static str,
+    pub detail_sign_in_hint: &'static str,
+    pub detail_reset_unavailable: &'static str,
+    /// "{duration}" is replaced with a relative countdown like "2h 13m".
+    pub detail_resets_in: &'static str,
+    pub detail_resets_now: &'static str,
+    /// "{ago}" is replaced with an elapsed duration like "2m".
+    pub detail_updated_ago: &'static str,
+    /// "{next}" is replaced with the time until the next poll.
+    pub detail_next_in: &'static str,
+    /// "{interval}" is replaced with the poll interval like "15m".
+    pub detail_poll_every: &'static str,
+    pub detail_rate_limited: &'static str,
+    pub detail_badge_rate_limited: &'static str,
+    pub detail_badge_error: &'static str,
+    pub detail_badge_loading: &'static str,
+    pub detail_stale: &'static str,
+    /// Short weekday names, Sunday first (SYSTEMTIME::wDayOfWeek order).
+    pub weekdays: [&'static str; 7],
 }
 
 pub fn resolve_language(language_override: Option<LanguageId>) -> LanguageId {

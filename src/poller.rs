@@ -4,6 +4,7 @@ use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -11,10 +12,11 @@ use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
 use crate::localization::Strings;
-use crate::models::{AppUsageData, UsageData, UsageSection};
+use crate::models::{AppUsageData, ProviderStatus, UsageData, UsageSection};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const CLAUDE_USER_AGENT: &str = "claude-code/2.1.85";
+const CLAUDE_USAGE_MIN_POLL_MS: u64 = 180_000;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
@@ -23,14 +25,12 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://cloudcode-pa.googleapis.com",
 ];
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollError {
     AuthRequired,
     NoCredentials,
     TokenExpired,
+    RateLimited(Option<u32>),
     RequestFailed,
 }
 
@@ -54,6 +54,14 @@ struct UsageBucket {
     utilization: f64,
     resets_at: Option<String>,
 }
+#[derive(Clone)]
+struct CachedClaudeUsage {
+    token_hash: u64,
+    fetched_at: SystemTime,
+    data: UsageData,
+}
+
+static CLAUDE_USAGE_CACHE: OnceLock<Mutex<Option<CachedClaudeUsage>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct CodexAuthFile {
@@ -205,6 +213,8 @@ fn poll_with(
                 if active_provider_count > 1 {
                     diagnose::log(format!("Claude Code usage poll failed: {error:?}"));
                 }
+                data.claude_code_error = Some(provider_status(error));
+                record_poll_error(&mut data, error);
                 first_error.get_or_insert(error);
             }
         }
@@ -217,6 +227,8 @@ fn poll_with(
                 if active_provider_count > 1 {
                     diagnose::log(format!("Codex usage poll failed: {error:?}"));
                 }
+                data.codex_error = Some(provider_status(error));
+                record_poll_error(&mut data, error);
                 first_error.get_or_insert(error);
             }
         }
@@ -229,6 +241,8 @@ fn poll_with(
                 if active_provider_count > 1 {
                     diagnose::log(format!("Antigravity usage poll failed: {error:?}"));
                 }
+                data.antigravity_error = Some(provider_status(error));
+                record_poll_error(&mut data, error);
                 first_error.get_or_insert(error);
             }
         }
@@ -241,6 +255,67 @@ fn poll_with(
     }
 }
 
+/// Collapse a poll error to display granularity (see models::ProviderStatus).
+pub fn provider_status(error: PollError) -> ProviderStatus {
+    match error {
+        PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired => {
+            ProviderStatus::AuthRequired
+        }
+        PollError::RateLimited(_) => ProviderStatus::RateLimited,
+        PollError::RequestFailed => ProviderStatus::RequestFailed,
+    }
+}
+
+fn record_poll_error(data: &mut AppUsageData, error: PollError) {
+    if let PollError::RateLimited(retry_after_ms) = error {
+        data.rate_limited = true;
+        if let Some(retry_after_ms) = retry_after_ms {
+            data.rate_limit_retry_after_ms = Some(
+                data.rate_limit_retry_after_ms
+                    .map_or(retry_after_ms, |current| current.max(retry_after_ms)),
+            );
+        }
+    }
+}
+
+fn claude_usage_cache() -> &'static Mutex<Option<CachedClaudeUsage>> {
+    CLAUDE_USAGE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn token_hash(token: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn cached_claude_usage(token_hash: u64) -> Option<UsageData> {
+    let cache = claude_usage_cache().lock().ok()?;
+    let cached = cache.as_ref()?;
+    if cached.token_hash != token_hash {
+        return None;
+    }
+    let age = SystemTime::now()
+        .duration_since(cached.fetched_at)
+        .unwrap_or_default();
+    if age > Duration::from_millis(CLAUDE_USAGE_MIN_POLL_MS) {
+        return None;
+    }
+    diagnose::log(format!(
+        "Claude usage poll skipped; using cached usage data age={}s",
+        age.as_secs()
+    ));
+    Some(cached.data.clone())
+}
+
+fn store_cached_claude_usage(token_hash: u64, data: &UsageData) {
+    if let Ok(mut cache) = claude_usage_cache().lock() {
+        *cache = Some(CachedClaudeUsage {
+            token_hash,
+            fetched_at: SystemTime::now(),
+            data: data.clone(),
+        });
+    }
+}
 fn poll_claude_code() -> Result<UsageData, PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
@@ -251,8 +326,14 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     };
 
     let creds = refresh_or_fallback(creds)?;
+    let token_hash = token_hash(&creds.access_token);
+    if let Some(cached) = cached_claude_usage(token_hash) {
+        return Ok(cached);
+    }
 
-    fetch_usage_with_fallback(&creds.access_token)
+    let data = fetch_usage_with_fallback(&creds.access_token)?;
+    store_cached_claude_usage(token_hash, &data);
+    Ok(data)
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
@@ -267,14 +348,14 @@ fn poll_codex() -> Result<UsageData, PollError> {
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
         Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            diagnose::log(
+                "Codex usage endpoint returned auth required; automatic CLI refresh is disabled because it would require running a model-capable Codex command.",
+            );
+            Err(PollError::AuthRequired)
         }
         Err(error) => Err(error),
     }
 }
-
 fn poll_antigravity() -> Result<UsageData, PollError> {
     let creds = match read_antigravity_credentials() {
         Some(creds) => creds,
@@ -294,17 +375,9 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
         }
 
         let source = creds.source.clone();
-        cli_refresh_token(&source);
-
-        match read_credentials_from_source(&source) {
-            Some(refreshed) if !is_token_expired(refreshed.expires_at) => return Ok(refreshed),
-            Some(_) => diagnose::log(format!(
-                "credentials from {source:?} still expired after refresh attempt"
-            )),
-            None => diagnose::log(format!(
-                "credentials from {source:?} unavailable after refresh attempt"
-            )),
-        }
+        diagnose::log(format!(
+            "Claude credentials from {source:?} are expired; automatic CLI refresh is disabled because it would require running a model-capable Claude command."
+        ));
 
         match read_next_credentials_after(&source) {
             Some(next) => creds = next,
@@ -312,139 +385,6 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
         }
     }
 }
-
-/// Invoke the Claude CLI with a minimal prompt to force its internal
-/// OAuth token refresh.
-fn cli_refresh_token(source: &CredentialSource) {
-    match source {
-        CredentialSource::Windows(_) => cli_refresh_windows_token(),
-        CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
-    }
-}
-
-fn cli_refresh_windows_token() {
-    let claude_path = resolve_windows_claude_path();
-    let is_cmd = claude_path.to_lowercase().ends_with(".cmd");
-    diagnose::log(format!(
-        "attempting Windows Claude token refresh via {claude_path}"
-    ));
-
-    let args: &[&str] = &["-p", "."];
-
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&claude_path).args(args);
-        c
-    } else {
-        let mut c = Command::new(&claude_path);
-        c.args(args);
-        c
-    };
-    cmd.env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Claude token refresh", error);
-            return;
-        }
-    };
-
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-fn cli_refresh_wsl_token(distro: &str) {
-    diagnose::log(format!(
-        "attempting WSL Claude token refresh in distro {distro}"
-    ));
-    let mut cmd = Command::new("wsl.exe");
-    cmd.arg("-d")
-        .arg(distro)
-        .arg("--")
-        .arg("bash")
-        .arg("-lic")
-        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
-        .env_remove("CLAUDECODE")
-        .env_remove("CLAUDE_CODE_ENTRYPOINT")
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn WSL Claude token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
-}
-
-fn cli_refresh_codex_token() {
-    let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
-    diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
-    ));
-
-    let args: &[&str] = &["exec", "."];
-
-    let mut cmd = if is_cmd {
-        let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
-        c
-    } else if is_ps1 {
-        let mut c = Command::new("powershell.exe");
-        c.arg("-NoProfile")
-            .arg("-ExecutionPolicy")
-            .arg("Bypass")
-            .arg("-File")
-            .arg(&codex_path)
-            .args(args);
-        c
-    } else {
-        let mut c = Command::new(&codex_path);
-        c.args(args);
-        c
-    };
-    cmd.creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(error) => {
-            diagnose::log_error("unable to spawn Windows Codex token refresh", error);
-            return;
-        }
-    };
-
-    wait_for_refresh(&mut child);
-}
-
 /// Spawn a command and wait up to `timeout` for it to finish.
 /// Returns None if the process fails to start or exceeds the deadline.
 fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
@@ -464,95 +404,6 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
             Err(_) => return None,
         }
     }
-}
-
-fn wait_for_refresh(child: &mut std::process::Child) {
-    // Wait up to 30 seconds; don't block the poll thread forever.
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-/// Resolve the full path to the `claude` CLI executable.
-fn resolve_windows_claude_path() -> String {
-    for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "claude.cmd".to_string()
-}
-
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -655,41 +506,31 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 }
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
-    // Try the dedicated usage endpoint first
     match try_usage_endpoint(token)? {
         Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
             if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
-                }
+                diagnose::log(
+                    "usage endpoint omitted one or more reset timers; keeping usage data and refusing Messages API fallback because it sends a model request.",
+                );
             }
-            return Ok(data);
+            Ok(data)
         }
-        None => {}
+        None => {
+            diagnose::log(
+                "usage endpoint unavailable; refusing Messages API fallback because it sends a model request.",
+            );
+            Err(PollError::RequestFailed)
+        }
     }
-
-    // Fall back to Messages API with rate limit headers
-    let result = fetch_usage_via_messages(token);
-    if result.is_err() {
-        diagnose::log("usage endpoint and Messages API fallback both failed");
-    }
-    result
 }
-
 fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     let agent = build_agent()?;
 
     let resp = match agent
         .get(USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .set("User-Agent", CLAUDE_USER_AGENT)
         .set("anthropic-beta", "oauth-2025-04-20")
         .call()
     {
@@ -700,12 +541,34 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
             ));
             return Err(PollError::AuthRequired);
         }
-        Err(_) => return Ok(None),
+        Err(ureq::Error::Status(429, response)) => {
+            let retry_after_ms = retry_after_ms(&response);
+            diagnose::log(format!(
+                "usage endpoint returned rate limit status 429; retry_after_ms={}",
+                retry_after_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+            return Err(PollError::RateLimited(retry_after_ms));
+        }
+        Err(ureq::Error::Status(code, _)) => {
+            diagnose::log(format!(
+                "usage endpoint returned HTTP status {code}; refusing Messages API fallback because it sends a model request"
+            ));
+            return Ok(None);
+        }
+        Err(error) => {
+            diagnose::log_error("Claude usage endpoint request failed", error);
+            return Ok(None);
+        }
     };
 
     let response: UsageResponse = match resp.into_json() {
         Ok(response) => response,
-        Err(_) => return Ok(None),
+        Err(error) => {
+            diagnose::log_error("unable to parse Claude usage endpoint response", error);
+            return Ok(None);
+        }
     };
     let mut data = UsageData::default();
 
@@ -722,82 +585,9 @@ fn try_usage_endpoint(token: &str) -> Result<Option<UsageData>, PollError> {
     Ok(Some(data))
 }
 
-fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
-
-    for model in MODEL_FALLBACK_CHAIN {
-        let body = serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "."}]
-        });
-
-        let response = match agent
-            .post(MESSAGES_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("anthropic-version", "2023-06-01")
-            .set("anthropic-beta", "oauth-2025-04-20")
-            .send_json(&body)
-        {
-            Ok(resp) => resp,
-            Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
-                diagnose::log(format!(
-                    "messages endpoint returned auth error status {code}; re-login required"
-                ));
-                return Err(PollError::AuthRequired);
-            }
-            Err(ureq::Error::Status(_code, resp)) => resp,
-            Err(_) => continue,
-        };
-
-        let h5 = response.header("anthropic-ratelimit-unified-5h-utilization");
-        let h7 = response.header("anthropic-ratelimit-unified-7d-utilization");
-        let hs = response.header("anthropic-ratelimit-unified-status");
-
-        if h5.is_some() || h7.is_some() || hs.is_some() {
-            return Ok(parse_rate_limit_headers(&response));
-        }
-    }
-
-    Err(PollError::RequestFailed)
-}
-
-fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
-    let mut data = UsageData::default();
-
-    data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
-    data.session.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-5h-reset",
-    ));
-
-    data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
-    data.weekly.resets_at = unix_to_system_time(get_header_i64(
-        response,
-        "anthropic-ratelimit-unified-7d-reset",
-    ));
-
-    let overall_reset = get_header_i64(response, "anthropic-ratelimit-unified-reset");
-
-    if data.session.percentage == 0.0 && data.weekly.percentage == 0.0 {
-        let status = response.header("anthropic-ratelimit-unified-status");
-        if status == Some("rejected") {
-            let claim = response.header("anthropic-ratelimit-unified-representative-claim");
-            match claim {
-                Some("five_hour") => data.session.percentage = 100.0,
-                Some("seven_day") => data.weekly.percentage = 100.0,
-                _ => {}
-            }
-        }
-
-        if data.session.resets_at.is_none() && overall_reset.is_some() {
-            data.session.resets_at = unix_to_system_time(overall_reset);
-        }
-    }
-
-    data
+fn retry_after_ms(response: &ureq::Response) -> Option<u32> {
+    let seconds = response.header("Retry-After")?.trim().parse::<u64>().ok()?;
+    Some(seconds.saturating_mul(1000).min(u32::MAX as u64) as u32)
 }
 
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
@@ -815,7 +605,7 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             diagnose::log(format!(
-                "Codex usage endpoint returned auth error status {code}; refresh required"
+                "Codex usage endpoint returned auth error status {code}; re-login required"
             ));
             return Err(PollError::AuthRequired);
         }
@@ -1147,17 +937,6 @@ fn is_antigravity_display_model(model: &str) -> bool {
         || model.starts_with("imagen")
 }
 
-fn get_header_f64(response: &ureq::Response, name: &str) -> f64 {
-    response
-        .header(name)
-        .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-fn get_header_i64(response: &ureq::Response, name: &str) -> Option<i64> {
-    response.header(name).and_then(|s| s.parse::<i64>().ok())
-}
-
 fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     let secs = unix_secs?;
     if secs < 0 {
@@ -1212,16 +991,6 @@ fn read_windows_credentials() -> Option<Credentials> {
         }
     };
     parse_credentials(&content, CredentialSource::Windows(cred_path))
-}
-
-fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials> {
-    match source {
-        CredentialSource::Windows(path) => {
-            let content = std::fs::read_to_string(path).ok()?;
-            parse_credentials(&content, source.clone())
-        }
-        CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
-    }
 }
 
 fn codex_auth_path() -> Option<PathBuf> {
@@ -1475,7 +1244,7 @@ fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
     None
 }
 
-/// Minimal datetime parser — avoids pulling in chrono/time crates.
+/// Minimal datetime parser - avoids pulling in chrono/time crates.
 fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
     let (date_str, time_str) = s.split_once('T').ok_or(())?;
@@ -1521,7 +1290,11 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text
+/// Format a usage section as "X% · Yh" style text for the widget and the
+/// tray tooltip. Time units stay compact ASCII (d/h/m/s) in every language:
+/// the widget's text cell is a fixed width, and localized unit words such as
+/// "分钟" overflow it and collide with the neighbouring column. The detail
+/// popup formats its own durations with the localized suffixes.
 pub fn format_line(section: &UsageSection, strings: Strings) -> String {
     let pct = format!("{:.0}%", section.percentage);
     let cd = format_countdown(section.resets_at, strings);
@@ -1543,7 +1316,7 @@ fn format_countdown(resets_at: Option<SystemTime>, strings: Strings) -> String {
         Err(_) => return strings.now.to_string(),
     };
 
-    format_countdown_from_secs(remaining.as_secs(), strings)
+    format_countdown_from_secs(remaining.as_secs())
 }
 
 /// Calculate how long until the display text would change
@@ -1553,19 +1326,19 @@ pub fn time_until_display_change(resets_at: Option<SystemTime>) -> Option<Durati
     Some(time_until_display_change_from_secs(remaining.as_secs()))
 }
 
-fn format_countdown_from_secs(total_secs: u64, strings: Strings) -> String {
+fn format_countdown_from_secs(total_secs: u64) -> String {
     let total_mins = total_secs / 60;
     let total_hours = total_secs / 3600;
     let total_days = total_secs / 86400;
 
     if total_days >= 1 {
-        format!("{total_days}{}", strings.day_suffix)
+        format!("{total_days}d")
     } else if total_hours >= 1 {
-        format!("{total_hours}{}", strings.hour_suffix)
+        format!("{total_hours}h")
     } else if total_mins >= 1 {
-        format!("{total_mins}{}", strings.minute_suffix)
+        format!("{total_mins}m")
     } else {
-        format!("{total_secs}{}", strings.second_suffix)
+        format!("{total_secs}s")
     }
 }
 
@@ -1592,12 +1365,6 @@ pub fn is_past_reset(data: &UsageData) -> bool {
     let now = SystemTime::now();
     let past = |s: &UsageSection| matches!(s.resets_at, Some(t) if now.duration_since(t).is_ok());
     past(&data.session) || past(&data.weekly)
-}
-
-pub fn app_is_past_reset(data: &AppUsageData) -> bool {
-    data.claude_code.as_ref().is_some_and(is_past_reset)
-        || data.codex.as_ref().is_some_and(is_past_reset)
-        || data.antigravity.as_ref().is_some_and(is_past_reset)
 }
 
 #[cfg(test)]
@@ -1627,6 +1394,8 @@ mod tests {
         .expect("codex data should keep the poll successful");
 
         assert!(data.claude_code.is_none());
+        assert_eq!(data.claude_code_error, Some(ProviderStatus::AuthRequired));
+        assert!(data.codex_error.is_none());
         assert_eq!(data.codex.unwrap().session.percentage, 42.0);
     }
 
@@ -1646,6 +1415,24 @@ mod tests {
         assert!(data.codex.is_none());
     }
 
+    #[test]
+    fn rate_limit_does_not_block_codex_when_both_are_enabled() {
+        let data = poll_with(
+            true,
+            true,
+            false,
+            || Err(PollError::RateLimited(Some(120_000))),
+            || Ok(usage_with_session_percent(42.0)),
+            || unreachable!("antigravity is disabled"),
+        )
+        .expect("codex data should keep the poll successful");
+
+        assert!(data.claude_code.is_none());
+        assert_eq!(data.claude_code_error, Some(ProviderStatus::RateLimited));
+        assert_eq!(data.codex.unwrap().session.percentage, 42.0);
+        assert!(data.rate_limited);
+        assert_eq!(data.rate_limit_retry_after_ms, Some(120_000));
+    }
     #[test]
     fn returns_first_error_when_no_enabled_provider_succeeds() {
         let error = poll_with(

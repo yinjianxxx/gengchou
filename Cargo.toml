@@ -1,20 +1,22 @@
 [package]
-name = "claude-code-usage-monitor"
-version = "1.4.8"
+name = "ai-usage-monitor"
+# Fork versioning starts at 2.x: also guarantees the manual update check never
+# treats an upstream 1.x release as newer (see updater::is_version_newer).
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
-description = "Claude Code Usage Monitor"
-homepage = "https://codezeno.com.au"
-repository = "https://github.com/CodeZeno/Claude-Code-Usage-Monitor"
+description = "AI Usage Monitor (stability fork of CodeZeno/Claude-Code-Usage-Monitor)"
+homepage = "https://github.com/yinjianxxx/ai-usage-monitor"
+repository = "https://github.com/yinjianxxx/ai-usage-monitor"
 
 [package.metadata.winres]
-CompanyName = "Code Zeno Pty Ltd"
-ProductName = "Claude Code Usage Monitor"
-FileDescription = "Claude Code Usage Monitor"
-OriginalFilename = "claude-code-usage-monitor.exe"
-InternalName = "ClaudeCodeUsageMonitor"
-Comments = "https://codezeno.com.au"
-LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
+CompanyName = "yinjianxxx"
+ProductName = "AI Usage Monitor"
+FileDescription = "AI Usage Monitor (independent community fork)"
+OriginalFilename = "ai-usage-monitor.exe"
+InternalName = "AIUsageMonitor"
+Comments = "Independent community fork of CodeZeno/Claude-Code-Usage-Monitor"
+LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 yinjianxxx"
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
@@ -38,14 +40,21 @@ features = [
     "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_RemoteDesktop",
+    "Win32_Graphics_Dwm",
 ]
 
 [build-dependencies]
 winres = "0.1"
 
+# NOTE: no `panic = "abort"` here. Aborting turned any stray panic (Win32
+# call failing during an RDP session switch, for example) into a silent
+# process death. Panics now unwind into the catch_unwind guards in window.rs
+# and get recorded by the panic hook in main.rs.
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
 codegen-units = 1
-panic = "abort"
