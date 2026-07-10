@@ -13,14 +13,6 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/screenshot.png" alt="Detail popup showing Claude Code and Codex usage bars with reset times" width="500">
-
-<br>
-
-<img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in the Windows taskbar">
-
-<sub>Real Windows 11 captures: the detail popup (top) and the embedded taskbar widget (bottom).</sub>
-
 </div>
 
 AI Usage Monitor is a lightweight native Windows app that keeps your current
@@ -28,8 +20,7 @@ AI Usage Monitor is a lightweight native Windows app that keeps your current
 one tray icon per provider — so you never open a dashboard just to check
 quota. Originally derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
-it has since focused on stability and multi-provider support
-([provenance](PROVENANCE.md)).
+it has since focused on stability ([provenance](PROVENANCE.md)).
 
 ## Install
 
@@ -40,8 +31,8 @@ currently unsigned; verify it against the release's `SHA256SUMS` if you wish
 (in-app updates check it automatically).
 
 Once [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395)
-is merged, WinGet will also work (not to be confused with the upstream
-package `CodeZeno.ClaudeCodeUsageMonitor`):
+is merged, WinGet will also work (not to be confused with the original
+project's package `CodeZeno.ClaudeCodeUsageMonitor`):
 
 ```powershell
 winget install --id yinjianxxx.AIUsageMonitor --exact

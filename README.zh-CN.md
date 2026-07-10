@@ -13,21 +13,13 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/screenshot.png" alt="展示 Claude Code 和 Codex 用量条与重置时间的详情弹窗" width="500">
-
-<br>
-
-<img src=".github/taskbar-widget.png" alt="嵌入 Windows 任务栏的 AI Usage Monitor 组件">
-
-<sub>Windows 11 实拍：详情弹窗（上）与嵌入任务栏的组件（下）。</sub>
-
 </div>
 
 AI Usage Monitor 是一款轻量级原生 Windows 应用，以任务栏组件和每服务商一个
 托盘图标的形式，让当前 5 小时和 7 天用量周期始终一目了然——无需为查配额
 打开服务商控制台。本项目最初派生自
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)，
-此后专注于稳定性与多服务商支持（[项目源流](PROVENANCE.md)）。
+此后专注于稳定性（[项目源流](PROVENANCE.md)）。
 
 ## 安装
 
@@ -37,7 +29,7 @@ AI Usage Monitor 是一款轻量级原生 Windows 应用，以任务栏组件和
 （应用内更新会自动校验）。
 
 待 [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395)
-合并后也可以通过 WinGet 安装（注意与上游软件包
+合并后也可以通过 WinGet 安装（注意与原项目软件包
 `CodeZeno.ClaudeCodeUsageMonitor` 区分）：
 
 ```powershell
@@ -114,7 +106,7 @@ cargo build --release --locked
 
 ## 稳定性
 
-本项目起步于对其派生代码的稳定性重做：外部 `WM_DESTROY`、`explorer.exe`
+本项目起步于对原项目代码的稳定性重做：外部 `WM_DESTROY`、`explorer.exe`
 任务栏重建和 RDP 会话切换会触发进程内恢复，重启进程仅作最终后备；panic
 会被记录而不是让进程无声退出。技术摘要见
 [PROVENANCE.md](PROVENANCE.md)（英文）。
