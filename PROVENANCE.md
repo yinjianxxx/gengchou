@@ -1,20 +1,21 @@
-# Fork Notes
+# Provenance
 
-This repository is a stability-focused fork of
+AI Usage Monitor is originally derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
-based on v1.4.8 (commit `9b29972`). Its primary goal is to survive Microsoft
-Remote Desktop transitions and explorer.exe taskbar rebuilds without crashing
-or permanently losing the embedded widget.
+based on v1.4.8 (commit `9b29972`). The project's initial goal was to survive
+Microsoft Remote Desktop transitions and explorer.exe taskbar rebuilds without
+crashing or permanently losing the embedded widget; it has since developed
+independently.
 
-## Upstream relationship
+## Relationship to the original project
 
+- The repository preserves the complete upstream git history; releases begin on the 2.x version line.
 - Upstream remote: `upstream` -> https://github.com/CodeZeno/Claude-Code-Usage-Monitor.git
-- Sync model: `git fetch upstream` followed by a reviewed merge from `upstream/main`.
-- The public history preserves the complete upstream history; fork releases begin on the 2.x version line.
+- Upstream changes may be reviewed and merged selectively when they benefit this project.
 
 ## Identity isolation
 
-| Item | Upstream | This fork |
+| Item | CodeZeno original | AI Usage Monitor |
 |---|---|---|
 | Package and EXE | claude-code-usage-monitor | ai-usage-monitor |
 | Version line | 1.4.x | 2.x |
@@ -22,7 +23,7 @@ or permanently losing the embedded widget.
 | Window class | ClaudeCodeUsageMonitor | AIUsageMonitor |
 | Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\AIUsageMonitor |
 | Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\AIUsageMonitor\diagnose.log |
-| Updates | Upstream GitHub Releases | This fork's GitHub Releases and independent EXE asset |
+| Updates | Upstream GitHub Releases | This project's GitHub Releases and independent EXE asset |
 | Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\AIUsageMonitor\updates |
 
 ## Stability changes

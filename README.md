@@ -26,9 +26,10 @@
 AI Usage Monitor is a lightweight native Windows app that keeps your current
 5-hour and 7-day usage windows visible at a glance — as a taskbar widget and
 one tray icon per provider — so you never open a dashboard just to check
-quota. It is an independent, stability-focused fork of
-[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
-([fork notes](FORK-NOTES.md)).
+quota. Originally derived from
+[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
+it has since focused on stability and multi-provider support
+([provenance](PROVENANCE.md)).
 
 ## Install
 
@@ -120,13 +121,13 @@ checks and user-approved update downloads. The app never:
 Provider bearer tokens travel inside each TLS request, so only configure
 proxies you trust.
 
-## Stability fork
+## Stability
 
-This fork exists to keep the widget alive through what used to kill it:
-external `WM_DESTROY`, `explorer.exe` taskbar rebuilds, and RDP session
-switches now trigger in-process recovery, with relaunch kept only as a last
-resort, and panics are logged instead of silently ending the process. See
-[FORK-NOTES.md](FORK-NOTES.md) for the technical summary.
+The project began as a stability rework of the code it derives from: external
+`WM_DESTROY`, `explorer.exe` taskbar rebuilds, and RDP session switches
+trigger in-process recovery, with relaunch kept only as a last resort, and
+panics are logged instead of silently ending the process. See
+[PROVENANCE.md](PROVENANCE.md) for the technical summary.
 
 ## Acknowledgements & license
 

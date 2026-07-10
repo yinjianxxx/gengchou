@@ -25,9 +25,9 @@
 
 AI Usage Monitor 是一款轻量级原生 Windows 应用，以任务栏组件和每服务商一个
 托盘图标的形式，让当前 5 小时和 7 天用量周期始终一目了然——无需为查配额
-打开服务商控制台。本项目是
-[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
-侧重稳定性的独立分支（[分支说明](FORK-NOTES.md)）。
+打开服务商控制台。本项目最初派生自
+[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)，
+此后专注于稳定性与多服务商支持（[项目源流](PROVENANCE.md)）。
 
 ## 安装
 
@@ -112,12 +112,12 @@ cargo build --release --locked
 
 服务商 Bearer 令牌包含在每个 TLS 请求中，请只配置你信任的代理。
 
-## 稳定性分支
+## 稳定性
 
-本分支的目标是让组件在过去会导致其消失的场景下存活：外部 `WM_DESTROY`、
-`explorer.exe` 任务栏重建和 RDP 会话切换现在会触发进程内恢复，重启进程仅作
-最终后备；panic 会被记录而不是让进程无声退出。技术摘要见
-[FORK-NOTES.md](FORK-NOTES.md)（英文）。
+本项目起步于对其派生代码的稳定性重做：外部 `WM_DESTROY`、`explorer.exe`
+任务栏重建和 RDP 会话切换会触发进程内恢复，重启进程仅作最终后备；panic
+会被记录而不是让进程无声退出。技术摘要见
+[PROVENANCE.md](PROVENANCE.md)（英文）。
 
 ## 致谢与许可证
 

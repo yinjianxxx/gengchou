@@ -103,5 +103,5 @@ jobs:
             dist/SHA256SUMS `
             --verify-tag `
             --title "AI Usage Monitor $env:GITHUB_REF_NAME" `
-            --notes "Release of the stability-focused fork based on CodeZeno v1.4.8. See README.md, README.zh-CN.md, and FORK-NOTES.md for details."
+            --notes "AI Usage Monitor release. Originally derived from CodeZeno/Claude-Code-Usage-Monitor v1.4.8; see README.md, README.zh-CN.md, and PROVENANCE.md for details."
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

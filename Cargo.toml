@@ -1,21 +1,22 @@
 [package]
 name = "ai-usage-monitor"
-# Fork versioning starts at 2.x: also guarantees the manual update check never
-# treats an upstream 1.x release as newer (see updater::is_version_newer).
+# Versioning starts at 2.x, above the original project's 1.x line: also
+# guarantees the manual update check never treats an upstream 1.x release as
+# newer (see updater::is_version_newer).
 version = "2.0.0"
 edition = "2021"
 license = "MIT"
-description = "AI Usage Monitor (stability fork of CodeZeno/Claude-Code-Usage-Monitor)"
+description = "Windows taskbar and tray usage monitor for Claude Code, Codex, and Antigravity"
 homepage = "https://github.com/yinjianxxx/ai-usage-monitor"
 repository = "https://github.com/yinjianxxx/ai-usage-monitor"
 
 [package.metadata.winres]
 CompanyName = "yinjianxxx"
 ProductName = "AI Usage Monitor"
-FileDescription = "AI Usage Monitor (independent community fork)"
+FileDescription = "AI Usage Monitor"
 OriginalFilename = "ai-usage-monitor.exe"
 InternalName = "AIUsageMonitor"
-Comments = "Independent community fork of CodeZeno/Claude-Code-Usage-Monitor"
+Comments = "Originally derived from CodeZeno/Claude-Code-Usage-Monitor"
 LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 yinjianxxx"
 
 [dependencies]

@@ -239,8 +239,8 @@ static SESSION_UNSTABLE_UNTIL: AtomicU64 = AtomicU64::new(0);
 /// (the usual PostMessage target) no longer exists.
 static UI_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
-/// The Win32 window class; also part of the fork's identity (kept distinct
-/// from upstream so both apps can run side by side).
+/// The Win32 window class; also part of the app's identity (kept distinct
+/// from the original CodeZeno app so both can run side by side).
 const WINDOW_CLASS_NAME: &str = "AIUsageMonitor";
 const DETAIL_WINDOW_CLASS_NAME: &str = "AIUsageMonitorDetails";
 /// Hidden top-level helper window. Two jobs the embedded widget cannot do
@@ -2775,7 +2775,7 @@ fn version_action_label(
     status: &UpdateStatus,
 ) -> String {
     let current = env!("CARGO_PKG_VERSION");
-    // No release channel configured (this fork's default): show the plain
+    // No release channel configured (this project's default): show the plain
     // version instead of a "Check for updates" action that can only fail.
     if !updater::update_channel_configured() {
         return format!("v{current}");
