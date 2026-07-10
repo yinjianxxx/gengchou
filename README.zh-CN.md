@@ -67,22 +67,25 @@ cargo build --release --locked
 
 ## 使用方法
 
-<img src=".github/taskbar-widget.png" alt="嵌入 Windows 任务栏的 AI Usage Monitor 组件">
-
-<sub>嵌入 Windows 11 任务栏的组件。</sub>
-
 - **左键单击**组件或托盘图标，打开或关闭详情弹窗。
 - **右键单击**打开设置菜单：服务商、刷新间隔、通知、开机启动等。
-- **拖动**组件左侧分隔线可调整位置；拖到另一条任务栏可切换显示器。
+
+### 任务栏组件
+
+<img src=".github/taskbar-widget.png" alt="嵌入 Windows 任务栏的 AI Usage Monitor 组件">
+
+组件直接嵌入任务栏。拖动左侧分隔线可调整位置；拖到另一条任务栏可切换
+显示器。
 
 ### 托盘图标
 
 <img src=".github/tray-icons.png" alt="Claude Code、Codex 和 Antigravity 托盘图标">
 
-数字为当前 5 小时用量；下方两条用量条分别对应 5 小时（上）和 7 天（下）
-用量。暂无数据时数字替换为服务商首字母，接近上限时切换为警告色。上图由
-应用自身渲染——运行 `.\ai-usage-monitor.exe --dump-tray-icons .\preview`
-可导出全部图标状态。
+每个已启用的服务商各有一个图标：数字为当前 5 小时用量，下方两条用量条
+分别对应 5 小时（上）和 7 天（下）用量。暂无数据时数字替换为服务商
+首字母，接近上限时切换为警告色。运行
+`.\ai-usage-monitor.exe --dump-tray-icons .\preview` 可导出全部图标状态
+以便细看。
 
 ## 服务商要求
 

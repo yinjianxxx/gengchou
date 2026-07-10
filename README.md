@@ -70,25 +70,27 @@ cargo build --release --locked
 
 ## Usage
 
-<img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in a Windows taskbar">
-
-<sub>The widget embedded in a Windows 11 taskbar.</sub>
-
 - **Left-click** the widget or a tray icon to open or close the detail popup.
 - **Right-click** either one for settings: providers, refresh interval,
   notifications, start with Windows, and more.
-- **Drag** the widget by its left divider to reposition it; drop it on
-  another taskbar to change monitors.
+
+### Taskbar widget
+
+<img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in a Windows taskbar">
+
+The widget embeds directly in the taskbar. Drag it by its left divider to
+reposition it; drop it on another taskbar to change monitors.
 
 ### Tray icons
 
 <img src=".github/tray-icons.png" alt="Claude Code, Codex, and Antigravity tray icons">
 
-The number is the current 5-hour usage; the bars underneath track the 5-hour
-(upper) and 7-day (lower) usage. With no data, the number gives way to the
-provider's initial; near a limit, it turns a warning colour. The preview
-above is rendered by the app itself —
-`.\ai-usage-monitor.exe --dump-tray-icons .\preview` exports every state.
+One icon per enabled provider: the number is the current 5-hour usage, and
+the bars underneath track the 5-hour (upper) and 7-day (lower) usage. With
+no data, the number gives way to the provider's initial; near a limit, it
+turns a warning colour. Run
+`.\ai-usage-monitor.exe --dump-tray-icons .\preview` to export every icon
+state for a closer look.
 
 ## Provider requirements
 
