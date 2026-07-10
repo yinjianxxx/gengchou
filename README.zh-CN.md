@@ -83,9 +83,8 @@ cargo build --release --locked
 
 每个已启用的服务商各有一个图标：数字为当前 5 小时用量，下方两条用量条
 分别对应 5 小时（上）和 7 天（下）用量。暂无数据时数字替换为服务商
-首字母，接近上限时切换为警告色。运行
-`.\ai-usage-monitor.exe --dump-tray-icons .\preview` 可导出全部图标状态
-以便细看。
+首字母，接近上限时切换为警告色。上图由应用自身渲染——运行
+`.\ai-usage-monitor.exe --dump-tray-icons .\preview` 可导出全部图标状态。
 
 ## 服务商要求
 

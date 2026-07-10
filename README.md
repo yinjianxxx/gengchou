@@ -88,9 +88,9 @@ reposition it; drop it on another taskbar to change monitors.
 One icon per enabled provider: the number is the current 5-hour usage, and
 the bars underneath track the 5-hour (upper) and 7-day (lower) usage. With
 no data, the number gives way to the provider's initial; near a limit, it
-turns a warning colour. Run
+turns a warning colour. The preview above is rendered by the app — run
 `.\ai-usage-monitor.exe --dump-tray-icons .\preview` to export every icon
-state for a closer look.
+state.
 
 ## Provider requirements
 
