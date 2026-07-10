@@ -1227,25 +1227,56 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
 }
 
 /// Parse an ISO 8601 timestamp string into a SystemTime.
+/// The APIs return formats like "2026-03-05T08:00:00.321598+00:00" and
+/// "2026-06-13T22:08:54Z"; non-zero UTC offsets are converted, not dropped.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    let s = s?.trim();
+    let t_pos = s.find('T')?;
+    let time_tail = &s[t_pos + 1..];
 
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
-        }
+    // Split off the timezone suffix: 'Z', or a '+HH:MM' / '-HH:MM' offset.
+    let (datetime_part, offset_secs) = if let Some(z_rel) = time_tail.find(['Z', 'z']) {
+        (&s[..t_pos + 1 + z_rel], 0)
+    } else if let Some(sign_rel) = time_tail.find(['+', '-']) {
+        let sign_pos = t_pos + 1 + sign_rel;
+        (&s[..sign_pos], parse_utc_offset_secs(&s[sign_pos..])?)
+    } else {
+        (s, 0)
+    };
+
+    let local_secs = parse_datetime_to_unix(datetime_part).ok()?;
+    // "08:00 at +02:00" is 06:00 UTC: subtract the offset.
+    let utc_secs = (local_secs as i64).checked_sub(offset_secs)?;
+    if utc_secs < 0 {
+        return None;
     }
-    None
+    Some(UNIX_EPOCH + Duration::from_secs(utc_secs as u64))
+}
+
+/// Parse "+HH:MM", "-HHMM", or "+HH" into signed seconds east of UTC.
+fn parse_utc_offset_secs(s: &str) -> Option<i64> {
+    let sign = match s.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &s[1..];
+    let (hours, minutes) = match rest.split_once(':') {
+        Some((hours, minutes)) => (hours, minutes),
+        None if rest.len() == 4 => (&rest[..2], &rest[2..]),
+        None if rest.len() == 2 => (rest, "0"),
+        None => return None,
+    };
+    let hours: i64 = hours.parse().ok()?;
+    let minutes: i64 = minutes.parse().ok()?;
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
 }
 
 /// Minimal datetime parser - avoids pulling in chrono/time crates.
-fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
+fn parse_datetime_to_unix(s: &str) -> Result<u64, ()> {
     // Extract date and time parts from "YYYY-MM-DDTHH:MM:SS[.frac]"
     let (date_str, time_str) = s.split_once('T').ok_or(())?;
     let date_parts: Vec<&str> = date_str.split('-').collect();
@@ -1257,6 +1288,14 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let month: u64 = date_parts[1].parse().map_err(|_| ())?;
     let day: u64 = date_parts[2].parse().map_err(|_| ())?;
 
+    // Bounds before arithmetic: month indexes month_days, day-1 must not
+    // underflow, and a huge year would spin the per-year loop below. The
+    // input is a provider API response, so a malformed value must fail the
+    // parse rather than panic or wrap into a bogus timestamp.
+    if !(1970..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(());
+    }
+
     // Strip fractional seconds
     let time_base = time_str.split('.').next().unwrap_or(time_str);
     let time_parts: Vec<&str> = time_base.split(':').collect();
@@ -1267,6 +1306,9 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
     let min: u64 = time_parts[1].parse().map_err(|_| ())?;
     let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
+    if hour > 23 || min > 59 || sec > 59 {
+        return Err(());
+    }
 
     // Days from year (using a simplified calculation for dates after 1970)
     let mut days: u64 = 0;
@@ -1518,5 +1560,46 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    #[test]
+    fn iso8601_accepts_the_provider_formats() {
+        // 2026-01-01T00:00:00Z is 1767225600 seconds after the epoch.
+        let expected = UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+        assert_eq!(parse_iso8601(Some("2026-01-01T00:00:00Z")), Some(expected));
+        assert_eq!(
+            parse_iso8601(Some("2026-01-01T00:00:00.321598+00:00")),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_iso8601(Some("1970-01-01T00:00:00Z")),
+            Some(UNIX_EPOCH)
+        );
+    }
+
+    #[test]
+    fn iso8601_converts_utc_offsets_instead_of_dropping_them() {
+        let utc = parse_iso8601(Some("2026-03-05T06:00:00Z"));
+        assert!(utc.is_some());
+        assert_eq!(parse_iso8601(Some("2026-03-05T08:00:00+02:00")), utc);
+        assert_eq!(parse_iso8601(Some("2026-03-05T01:00:00-05:00")), utc);
+        assert_eq!(parse_iso8601(Some("2026-03-05T08:00:00+0200")), utc);
+    }
+
+    #[test]
+    fn iso8601_rejects_malformed_input_without_panicking() {
+        for input in [
+            "2026-99-05T00:00:00Z",      // month out of range
+            "2026-00-05T00:00:00Z",      // month zero
+            "2026-03-00T00:00:00Z",      // day zero
+            "2026-03-05T99:00:00Z",      // hour out of range
+            "1969-12-31T23:59:59Z",      // before the epoch
+            "2026-03-05T08:00:00+99:00", // bogus offset
+            "not a timestamp",
+            "",
+        ] {
+            assert_eq!(parse_iso8601(Some(input)), None, "input: {input}");
+        }
+        assert_eq!(parse_iso8601(None), None);
     }
 }
