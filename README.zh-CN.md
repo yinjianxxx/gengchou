@@ -13,7 +13,7 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/screenshot.png" alt="展示 Claude Code 和 Codex 用量条与重置时间的详情弹窗" width="480">
+<img src=".github/screenshot.png" alt="展示 Claude Code、Codex 和 Antigravity 用量与重置时间的详情弹窗" width="480">
 
 <sub>详情弹窗——Windows 11 实拍，深色主题。</sub>
 

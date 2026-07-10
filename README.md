@@ -13,7 +13,7 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/screenshot.png" alt="Detail popup showing Claude Code and Codex usage bars with reset times" width="480">
+<img src=".github/screenshot.png" alt="Detail popup showing Claude Code, Codex, and Antigravity usage with reset times" width="480">
 
 <sub>The detail popup — captured on Windows 11, dark theme.</sub>
 
