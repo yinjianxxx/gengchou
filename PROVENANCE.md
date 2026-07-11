@@ -10,8 +10,9 @@ independently.
 ## Relationship to the original project
 
 - The repository preserves the complete upstream git history; releases begin on the 2.x version line.
-- Upstream remote: `upstream` -> https://github.com/CodeZeno/Claude-Code-Usage-Monitor.git
-- Upstream changes may be reviewed and merged selectively when they benefit this project.
+- Original source repository: [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor).
+- No ongoing synchronization with the upstream projects is planned. Their repositories remain referenced for provenance, comparison, and occasional security review.
+- Relevant fixes may still be evaluated independently; this is not a commitment to track or merge upstream releases.
 
 ## Identity isolation
 

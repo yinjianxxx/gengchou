@@ -28,19 +28,31 @@ it is now developed independently ([provenance](PROVENANCE.md)).
 
 ## Install
 
-Download `ai-usage-monitor.exe` from the
-[latest release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
-and run it from any folder you can write to — no installer. The binary is
-currently unsigned; the release's `SHA256SUMS` lets you verify the download,
-and self-updates check it automatically.
+Installation options, in recommended order:
 
-A WinGet package is pending review in
-[microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
-Once it lands:
+1. **WinGet (preferred when available).** The initial package status is tracked
+   in [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
+   Try:
 
-```powershell
-winget install --id yinjianxxx.AIUsageMonitor --exact
-```
+   ```powershell
+   winget install --id yinjianxxx.AIUsageMonitor --exact
+   ```
+
+   If WinGet does not find `yinjianxxx.AIUsageMonitor` yet, use the ZIP below.
+
+2. **Portable ZIP (recommended manual download).** Download
+   `ai-usage-monitor-windows-x64.zip` from the
+   [latest release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest),
+   extract it to any folder you can write to, and run
+   `ai-usage-monitor.exe`. The bundle includes both READMEs and the retained
+   license and attribution notices.
+
+3. **Standalone EXE.** For a single-file download, get
+   `ai-usage-monitor.exe` from the same release and run it from any writable
+   folder.
+
+The executable is currently unsigned. Each release includes `SHA256SUMS` for
+download verification, and self-updates check it automatically.
 
 The similarly named `CodeZeno.ClaudeCodeUsageMonitor` package is the
 original project, not this app.

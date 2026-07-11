@@ -27,18 +27,29 @@ AI Usage Monitor 是一款轻量级原生 Windows 应用，把当前 5 小时和
 
 ## 安装
 
-从[最新 Release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
-下载 `ai-usage-monitor.exe`，放在任意可写目录直接运行，无需安装器。
-可执行文件目前未做代码签名；Release 附带 `SHA256SUMS` 供校验下载，
-应用内更新会自动核对。
+推荐按以下顺序选择安装方式：
 
-WinGet 软件包正在
-[microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395)
-审核中，合并后即可使用：
+1. **WinGet（可用时首选）。** 初始软件包状态见
+   [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395)
+   ，可尝试运行：
 
-```powershell
-winget install --id yinjianxxx.AIUsageMonitor --exact
-```
+   ```powershell
+   winget install --id yinjianxxx.AIUsageMonitor --exact
+   ```
+
+   如果 WinGet 仍找不到 `yinjianxxx.AIUsageMonitor`，请使用下面的 ZIP。
+
+2. **便携 ZIP（推荐的手动下载方式）。** 从
+   [最新 Release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
+   下载 `ai-usage-monitor-windows-x64.zip`，解压到任意可写目录后运行
+   `ai-usage-monitor.exe`。压缩包同时包含中英文 README，以及保留的许可和
+   归属声明。
+
+3. **独立 EXE。** 如需单文件下载，可从同一 Release 获取
+   `ai-usage-monitor.exe`，放在任意可写目录直接运行。
+
+可执行文件目前未做代码签名；每个 Release 均附带 `SHA256SUMS` 供校验
+下载，应用内更新也会自动核对。
 
 名称相近的 `CodeZeno.ClaudeCodeUsageMonitor` 是原项目的软件包，不是本应用。
 

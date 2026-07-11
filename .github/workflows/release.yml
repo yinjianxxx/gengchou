@@ -63,6 +63,7 @@ jobs:
           Copy-Item -LiteralPath DEPENDENCY_LICENSES.md -Destination dist\DEPENDENCY_LICENSES.md
           Copy-Item -LiteralPath README.md -Destination dist\README.md
           Copy-Item -LiteralPath README.zh-CN.md -Destination dist\README.zh-CN.md
+          Copy-Item -LiteralPath PROVENANCE.md -Destination dist\PROVENANCE.md
 
           $bundleFiles = @(
             "dist\ai-usage-monitor.exe",
@@ -70,9 +71,35 @@ jobs:
             "dist\THIRD_PARTY_NOTICES.md",
             "dist\DEPENDENCY_LICENSES.md",
             "dist\README.md",
-            "dist\README.zh-CN.md"
+            "dist\README.zh-CN.md",
+            "dist\PROVENANCE.md"
           )
           Compress-Archive -LiteralPath $bundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $requiredBundleEntries = @(
+            'ai-usage-monitor.exe',
+            'LICENSE',
+            'THIRD_PARTY_NOTICES.md',
+            'DEPENDENCY_LICENSES.md',
+            'README.md',
+            'README.zh-CN.md',
+            'PROVENANCE.md'
+          )
+          $archive = [System.IO.Compression.ZipFile]::OpenRead(
+            (Resolve-Path -LiteralPath dist\ai-usage-monitor-windows-x64.zip)
+          )
+          try {
+            $bundleEntries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($requiredEntry in $requiredBundleEntries) {
+              if ($requiredEntry -notin $bundleEntries) {
+                throw ('Release bundle is missing required entry: {0}' -f $requiredEntry)
+              }
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
 
           $assetNames = @(
             "ai-usage-monitor.exe",
@@ -94,6 +121,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          $notesFile = Join-Path '.github/release-notes' ($env:GITHUB_REF_NAME + '.md')
+          if (-not (Test-Path -LiteralPath $notesFile -PathType Leaf)) {
+            throw ('Release notes file not found: {0}' -f $notesFile)
+          }
+          $notes = Get-Content -LiteralPath $notesFile -Raw
+          if ($notes.Contains('RELEASE_NOTES_TODO')) {
+            throw ('Release notes still contain placeholders: {0}' -f $notesFile)
+          }
+
           gh release create $env:GITHUB_REF_NAME `
             dist/ai-usage-monitor.exe `
             dist/ai-usage-monitor-windows-x64.zip `
@@ -103,5 +139,5 @@ jobs:
             dist/SHA256SUMS `
             --verify-tag `
             --title "AI Usage Monitor $env:GITHUB_REF_NAME" `
-            --notes "AI Usage Monitor release. Originally derived from CodeZeno/Claude-Code-Usage-Monitor v1.4.8; see README.md, README.zh-CN.md, and PROVENANCE.md for details."
+            --notes-file $notesFile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
