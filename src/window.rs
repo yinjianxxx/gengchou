@@ -174,6 +174,9 @@ const WM_APP_REVIVE: u32 = WM_APP + 4;
 /// Thread message posted by the revival background thread once the taskbar
 /// set is stable and the UI thread should recreate/re-attach the widget.
 const WM_APP_REVIVE_READY: u32 = WM_APP + 5;
+/// Stable process-level request for the UI thread to perform a deliberate
+/// shutdown, even if the embedded main window was replaced during revival.
+const WM_APP_REQUEST_QUIT: u32 = WM_APP + 6;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// WM_WTSSESSION_CHANGE and the wparam values we care about (winuser.h).
@@ -550,6 +553,39 @@ fn post_revive_ready() {
         clear_reviving();
         diagnose::log("revival: unable to reach the UI thread with the ready signal");
     }
+}
+
+/// Ask the UI thread to perform the deliberate-quit cleanup without relying
+/// on the current embedded window handle, which revival may replace while an
+/// update is downloading. The hidden broadcast helper normally lives for the
+/// whole process; the thread queue is the fallback if that window is gone.
+fn request_process_quit() {
+    let helper = BROADCAST_HELPER_HWND.load(Ordering::SeqCst);
+    if helper != 0 {
+        let helper = HWND(helper as *mut _);
+        let posted = unsafe {
+            IsWindow(helper).as_bool()
+                && PostMessageW(helper, WM_APP_REQUEST_QUIT, WPARAM(0), LPARAM(0)).is_ok()
+        };
+        if posted {
+            return;
+        }
+    }
+
+    let thread_id = UI_THREAD_ID.load(Ordering::SeqCst);
+    let posted = thread_id != 0
+        && unsafe {
+            PostThreadMessageW(thread_id, WM_APP_REQUEST_QUIT, WPARAM(0), LPARAM(0)).is_ok()
+        };
+    if posted {
+        return;
+    }
+
+    // The helper has already been launched and is waiting for this PID. If the
+    // UI thread cannot be reached at all, process termination is the only way
+    // to avoid stranding the helper until its timeout.
+    diagnose::log("update quit request could not reach the UI thread; exiting directly");
+    std::process::exit(0);
 }
 
 /// Second stage of revival, on the UI thread with no long waits: bring the
@@ -1454,6 +1490,46 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
             PCWSTR::from_raw(title_wide.as_ptr()),
             MB_OK | MB_ICONINFORMATION,
         );
+    }
+}
+
+/// Exit the process deliberately from the UI thread.
+///
+/// Update workers reach this through the process-level `WM_APP_REQUEST_QUIT`
+/// channel; menu Exit and a normal `WM_CLOSE` call it directly. Mark the quit
+/// before ending the message loop so a concurrent window destruction
+/// can never be mistaken for an explorer-triggered teardown and revived.
+unsafe fn request_quit(hwnd: HWND) {
+    if QUIT_REQUESTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    diagnose::log("deliberate quit requested");
+    let (hook, detail_hwnd) = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) => (s.win_event_hook.take(), s.details_hwnd),
+            None => (None, None),
+        }
+    };
+    if let Some(hook) = hook {
+        native_interop::unhook_win_event(hook);
+    }
+    if let Some(detail_hwnd) = detail_hwnd {
+        let _ = DestroyWindow(detail_hwnd);
+    }
+
+    if hwnd == HWND::default() || !IsWindow(hwnd).as_bool() {
+        diagnose::log("deliberate quit: main window unavailable; ending message loop directly");
+        PostQuitMessage(0);
+        return;
+    }
+    if let Err(error) = DestroyWindow(hwnd) {
+        diagnose::log_error(
+            "deliberate quit: failed to destroy main window; ending message loop directly",
+            error,
+        );
+        PostQuitMessage(0);
     }
 }
 
@@ -2806,29 +2882,29 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
         return;
     }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let (strings, install_channel) = {
+    let (strings, install_channel, already_in_progress) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
+        let strings = app_state.language.strings();
+        let already_in_progress = matches!(
             app_state.update_status,
             UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            if interactive {
-                show_info_message(
-                    hwnd,
-                    app_state.language.strings().updates,
-                    app_state.language.strings().update_in_progress,
-                );
-            }
-            return;
+        );
+        if !already_in_progress {
+            app_state.update_status = UpdateStatus::Checking;
         }
 
-        app_state.update_status = UpdateStatus::Checking;
-        (app_state.language.strings(), app_state.install_channel)
+        (strings, app_state.install_channel, already_in_progress)
     };
+    if already_in_progress {
+        if interactive {
+            show_info_message(hwnd, strings.updates, strings.update_in_progress);
+        }
+        return;
+    }
 
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
@@ -2892,34 +2968,32 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
 
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let strings = {
+    let (strings, already_in_progress) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
+        let strings = app_state.language.strings();
+        let already_in_progress = matches!(
             app_state.update_status,
             UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            show_info_message(
-                hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
-            );
-            return;
+        );
+        if !already_in_progress {
+            app_state.update_status = UpdateStatus::Applying;
         }
 
-        app_state.update_status = UpdateStatus::Applying;
-        app_state.language.strings()
+        (strings, already_in_progress)
     };
+    if already_in_progress {
+        show_info_message(hwnd, strings.updates, strings.update_in_progress);
+        return;
+    }
 
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
         match updater::begin_self_update(&release) {
-            Ok(()) => unsafe {
-                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-            },
+            Ok(()) => request_process_quit(),
             Err(error) => {
                 {
                     let mut state = lock_state();
@@ -2945,9 +3019,7 @@ fn begin_winget_update(hwnd: HWND) {
     .unwrap_or(LanguageId::English.strings());
 
     match updater::begin_winget_update() {
-        Ok(()) => unsafe {
-            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
-        },
+        Ok(()) => request_process_quit(),
         Err(error) => {
             let message = format!("{}.\n\n{}", strings.update_failed, error);
             show_error_message(hwnd, strings.updates, &message);
@@ -3286,6 +3358,14 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             revive_execute();
             LRESULT(0)
         }
+        _ if msg == WM_APP_REQUEST_QUIT => {
+            let main_hwnd = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.hwnd.to_hwnd()).unwrap_or_default()
+            };
+            request_quit(main_hwnd);
+            LRESULT(0)
+        }
         // A second launched instance asks us to surface the detail popup
         // (posted from run()'s single-instance guard).
         _ if msg == WM_APP_TRAY => {
@@ -3621,6 +3701,12 @@ pub fn run() {
         // Initial theme check
         check_theme_change();
 
+        if let Err(error) = updater::confirm_update_ready() {
+            diagnose::log(format!(
+                "unable to confirm successful update startup: {error}"
+            ));
+        }
+
         // Message loop
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
@@ -3628,6 +3714,14 @@ pub fn run() {
             // They cannot go through wnd_proc because the window is gone.
             if msg.hwnd == HWND::default() && msg.message == WM_APP_REVIVE {
                 revive_request();
+                continue;
+            }
+            if msg.hwnd == HWND::default() && msg.message == WM_APP_REQUEST_QUIT {
+                let main_hwnd = {
+                    let state = lock_state();
+                    state.as_ref().map(|s| s.hwnd.to_hwnd()).unwrap_or_default()
+                };
+                request_quit(main_hwnd);
                 continue;
             }
             if msg.hwnd == HWND::default() && msg.message == WM_APP_REVIVE_READY {
@@ -4946,6 +5040,10 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             show_context_menu(hwnd);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            request_quit(hwnd);
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = wparam.0 as u16;
             match id {
@@ -4985,22 +5083,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     }
                 }
                 2 => {
-                    // Deliberate quit: WM_DESTROY (if any) must not revive.
-                    QUIT_REQUESTED.store(true, Ordering::SeqCst);
-                    let hook = {
-                        let state = lock_state();
-                        state.as_ref().and_then(|s| s.win_event_hook)
-                    };
-                    if let Some(h) = hook {
-                        native_interop::unhook_win_event(h);
-                    }
-                    if let Some(detail_hwnd) = {
-                        let state = lock_state();
-                        state.as_ref().and_then(|s| s.details_hwnd)
-                    } {
-                        let _ = DestroyWindow(detail_hwnd);
-                    }
-                    PostQuitMessage(0);
+                    request_quit(hwnd);
                 }
                 IDM_RESET_POSITION => {
                     {

@@ -35,5 +35,18 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      - name: Build updater helper test binary
+        run: cargo build --locked
+
+      - name: Test updater helper success hand-off
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\updater_e2e.ps1 -Scenario Success
+
+      - name: Test updater helper child-exit rollback
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\updater_e2e.ps1 -Scenario ChildExit
+
       - name: Build release binary
         run: cargo build --release --locked

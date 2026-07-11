@@ -3,7 +3,7 @@ name = "ai-usage-monitor"
 # Versioning starts at 2.x, above the original project's 1.x line: also
 # guarantees the manual update check never treats an upstream 1.x release as
 # newer (see updater::is_version_newer).
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 license = "MIT"
 description = "Windows taskbar and tray usage monitor for Claude Code, Codex, and Antigravity"
@@ -46,6 +46,7 @@ features = [
     "Win32_System_Time",
     "Win32_System_RemoteDesktop",
     "Win32_Graphics_Dwm",
+    "Win32_Storage_FileSystem",
 ]
 
 [build-dependencies]
