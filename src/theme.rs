@@ -1,7 +1,12 @@
 use windows::core::PCWSTR;
+use windows::Win32::Graphics::Gdi::{GetSysColor, SYS_COLOR_INDEX};
 use windows::Win32::System::Registry::*;
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+};
 
-use crate::native_interop::wide_str;
+use crate::native_interop::{wide_str, Color};
 
 const REGISTRY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 const REGISTRY_KEY: &str = "SystemUsesLightTheme";
@@ -9,6 +14,27 @@ const REGISTRY_KEY: &str = "SystemUsesLightTheme";
 /// Check if the system is in dark mode by reading the registry
 pub fn is_dark_mode() -> bool {
     !is_light_theme()
+}
+
+pub fn is_high_contrast() -> bool {
+    unsafe {
+        let mut high_contrast = HIGHCONTRASTW {
+            cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            ..Default::default()
+        };
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            high_contrast.cbSize,
+            Some(&mut high_contrast as *mut _ as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+            && high_contrast.dwFlags.contains(HCF_HIGHCONTRASTON)
+    }
+}
+
+pub fn system_color(index: SYS_COLOR_INDEX) -> Color {
+    Color::from_colorref(unsafe { GetSysColor(index) })
 }
 
 fn is_light_theme() -> bool {

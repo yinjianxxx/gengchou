@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,8 @@ const UPDATE_READY_GRACE: Duration = Duration::from_secs(2);
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REPLACE_RETRY_DELAY: Duration = Duration::from_millis(500);
 const REPLACE_ATTEMPTS: usize = 60;
+const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CHECKSUM_MANIFEST_BYTES: u64 = 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 // Keep this aligned with the package identifier used in winget-pkgs.
@@ -392,19 +394,9 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         return Ok(None);
     }
 
-    let asset = release
-        .assets
-        .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name.to_ascii_lowercase().ends_with(".exe"))
-        })
-        .ok_or_else(|| {
-            "No Windows executable asset was found in the latest release.".to_string()
-        })?;
+    let asset = exact_release_asset(&release.assets).ok_or_else(|| {
+        format!("The latest release does not contain the required {RELEASE_ASSET_NAME} asset.")
+    })?;
 
     let checksums_url = release
         .assets
@@ -417,6 +409,12 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
         asset_url: asset.browser_download_url.clone(),
         checksums_url,
     }))
+}
+
+fn exact_release_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
 }
 
 fn build_agent() -> Result<ureq::Agent, String> {
@@ -436,19 +434,63 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
         .call()
         .map_err(|e| format!("Unable to download the latest release: {e}"))?;
 
-    let mut reader = response.into_reader();
-    let mut file = File::create(partial_path)
-        .map_err(|e| format!("Unable to create temporary download file: {e}"))?;
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_UPDATE_DOWNLOAD_BYTES)
+    {
+        return Err(format!(
+            "The update download exceeds the {} MiB safety limit.",
+            MAX_UPDATE_DOWNLOAD_BYTES / 1024 / 1024
+        ));
+    }
 
-    io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("Unable to write the downloaded update: {e}"))?;
-    file.flush()
-        .map_err(|e| format!("Unable to finalize the downloaded update: {e}"))?;
+    let result = (|| {
+        let mut reader = response.into_reader();
+        let mut file = File::create(partial_path)
+            .map_err(|e| format!("Unable to create temporary download file: {e}"))?;
+        copy_limited(&mut reader, &mut file, MAX_UPDATE_DOWNLOAD_BYTES)
+            .map_err(|e| format!("Unable to write the downloaded update: {e}"))?;
+        file.flush()
+            .and_then(|_| file.sync_all())
+            .map_err(|e| format!("Unable to finalize the downloaded update: {e}"))
+    })();
+    if let Err(error) = result {
+        let _ = remove_file_if_exists(partial_path);
+        return Err(error);
+    }
 
     std::fs::rename(partial_path, final_path)
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
 
     Ok(())
+}
+
+fn copy_limited(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    max_bytes: u64,
+) -> io::Result<u64> {
+    let copied = io::copy(&mut reader.take(max_bytes.saturating_add(1)), writer)?;
+    if copied > max_bytes {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "download exceeded the configured size limit",
+        ))
+    } else {
+        Ok(copied)
+    }
+}
+
+fn response_string_limited(
+    response: ureq::Response,
+    max_bytes: u64,
+    description: &str,
+) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    copy_limited(&mut response.into_reader(), &mut bytes, max_bytes)
+        .map_err(|error| format!("Unable to read {description}: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| format!("{description} is not valid UTF-8: {error}"))
 }
 
 /// Compare the downloaded binary against the release's SHA256SUMS manifest.
@@ -465,13 +507,16 @@ fn verify_download_checksum(
     })?;
 
     let agent = build_agent()?;
-    let manifest = agent
+    let manifest_response = agent
         .get(checksums_url)
         .set("User-Agent", user_agent())
         .call()
-        .map_err(|e| format!("Unable to download the release {CHECKSUMS_ASSET_NAME} file: {e}"))?
-        .into_string()
-        .map_err(|e| format!("Unable to read the release {CHECKSUMS_ASSET_NAME} file: {e}"))?;
+        .map_err(|e| format!("Unable to download the release {CHECKSUMS_ASSET_NAME} file: {e}"))?;
+    let manifest = response_string_limited(
+        manifest_response,
+        MAX_CHECKSUM_MANIFEST_BYTES,
+        &format!("the release {CHECKSUMS_ASSET_NAME} file"),
+    )?;
 
     let expected = expected_checksum_from_manifest(&manifest, RELEASE_ASSET_NAME)
         .ok_or_else(|| {
@@ -511,7 +556,7 @@ fn file_sha256_hex(path: &Path, description: &str) -> Result<String, String> {
 }
 
 /// SHA-256 via the Windows CNG provider: no extra hashing crate needed.
-fn sha256_hex(data: &[u8]) -> Result<String, String> {
+pub(crate) fn sha256_hex(data: &[u8]) -> Result<String, String> {
     use windows::Win32::Security::Cryptography::{
         BCryptCloseAlgorithmProvider, BCryptCreateHash, BCryptDestroyHash, BCryptFinishHash,
         BCryptHashData, BCryptOpenAlgorithmProvider, BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE,
@@ -1115,11 +1160,13 @@ fn write_ready_marker(marker: &Path) -> Result<(), String> {
 fn updater_ui_disabled_for_tests() -> bool {
     #[cfg(debug_assertions)]
     {
-        return std::env::var(UPDATE_TEST_NO_UI_ENV).as_deref() == Ok("1");
+        std::env::var(UPDATE_TEST_NO_UI_ENV).as_deref() == Ok("1")
     }
 
     #[cfg(not(debug_assertions))]
-    false
+    {
+        false
+    }
 }
 
 fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
@@ -1418,6 +1465,40 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn release_asset_selection_refuses_arbitrary_executables() {
+        let wrong = [GitHubAsset {
+            name: "other.exe".to_string(),
+            browser_download_url: "https://example.invalid/other.exe".to_string(),
+        }];
+        assert!(exact_release_asset(&wrong).is_none());
+
+        let exact = [GitHubAsset {
+            name: RELEASE_ASSET_NAME.to_ascii_uppercase(),
+            browser_download_url: "https://example.invalid/app.exe".to_string(),
+        }];
+        assert_eq!(
+            exact_release_asset(&exact).map(|asset| asset.browser_download_url.as_str()),
+            Some("https://example.invalid/app.exe")
+        );
+    }
+
+    #[test]
+    fn limited_copy_rejects_streams_larger_than_the_cap() {
+        let mut source = io::Cursor::new(vec![0u8; 5]);
+        let mut destination = Vec::new();
+        let error = copy_limited(&mut source, &mut destination, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn limited_copy_accepts_streams_at_the_cap() {
+        let mut source = io::Cursor::new(vec![1u8; 4]);
+        let mut destination = Vec::new();
+        assert_eq!(copy_limited(&mut source, &mut destination, 4).unwrap(), 4);
+        assert_eq!(destination, vec![1u8; 4]);
     }
 
     #[test]

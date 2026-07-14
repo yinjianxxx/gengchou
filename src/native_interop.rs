@@ -114,9 +114,37 @@ pub fn get_window_rect_safe(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// Embed our window as a child of the taskbar
-pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
+fn embedding_state_is_valid(parent: HWND, taskbar_hwnd: HWND, style: u32) -> bool {
+    parent == taskbar_hwnd && style & WS_CHILD_STYLE != 0 && style & WS_POPUP_STYLE == 0
+}
+
+/// Verify the live relationship instead of inferring it from a transient
+/// taskbar enumeration. During display/RDP transitions Explorer can briefly
+/// omit a still-valid taskbar HWND from `EnumWindows`.
+pub fn is_embedded_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> bool {
     unsafe {
+        if !IsWindow(hwnd).as_bool() || !IsWindow(taskbar_hwnd).as_bool() {
+            return false;
+        }
+        let parent = GetAncestor(hwnd, GA_PARENT);
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        embedding_state_is_valid(parent, taskbar_hwnd, style)
+    }
+}
+
+fn popup_state_is_valid(owner_or_parent: HWND, style: u32) -> bool {
+    owner_or_parent == HWND::default() && style & WS_CHILD_STYLE == 0 && style & WS_POPUP_STYLE != 0
+}
+
+/// Embed our window as a child of the taskbar and verify the resulting Shell
+/// relationship. Win32 setters can report an ambiguous zero return value, so
+/// the final parent/style state is the source of truth.
+pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) -> Result<(), String> {
+    unsafe {
+        if !IsWindow(hwnd).as_bool() || !IsWindow(taskbar_hwnd).as_bool() {
+            return Err("widget or taskbar window handle is no longer valid".to_string());
+        }
+
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(
@@ -131,19 +159,62 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
         let _ = SetParent(hwnd, taskbar_hwnd);
+
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let parent = GetAncestor(hwnd, GA_PARENT);
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if embedding_state_is_valid(parent, taskbar_hwnd, style) {
+            Ok(())
+        } else {
+            Err(format!(
+                "taskbar embedding verification failed: parent={parent:?} expected={taskbar_hwnd:?} style={style:#010x}"
+            ))
+        }
     }
 }
 
-/// Undo `embed_in_taskbar`: turn the window back into a top-level popup.
-/// Used when a surviving window must fall back to popup mode because no
-/// taskbar is available to host it (e.g. after an RDP session switch).
-pub fn detach_to_popup(hwnd: HWND) {
+/// Undo `embed_in_taskbar`: turn the window back into a top-level popup
+/// style. Callers keep that transitional window hidden until taskbar
+/// re-embedding succeeds.
+pub fn detach_to_popup(hwnd: HWND) -> Result<(), String> {
     unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return Err("widget window handle is no longer valid".to_string());
+        }
         // Clear WS_CHILD before re-parenting to the desktop, per SetParent docs.
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_CHILD_STYLE) | WS_POPUP_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
         let _ = SetParent(hwnd, HWND::default());
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        // GetAncestor(GA_PARENT) reports the desktop window for an unowned
+        // top-level popup. GetParent reports its owner instead, which is null
+        // for the detached window we create.
+        let owner_or_parent = GetParent(hwnd).unwrap_or_default();
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+        if popup_state_is_valid(owner_or_parent, style) {
+            Ok(())
+        } else {
+            Err(format!(
+                "detached popup verification failed: owner_or_parent={owner_or_parent:?} style={style:#010x}"
+            ))
+        }
     }
 }
 
@@ -221,7 +292,47 @@ impl Color {
         Self { r, g, b }
     }
 
+    pub const fn from_colorref(value: u32) -> Self {
+        Self {
+            r: (value & 0xFF) as u8,
+            g: ((value >> 8) & 0xFF) as u8,
+            b: ((value >> 16) & 0xFF) as u8,
+        }
+    }
+
     pub fn to_colorref(self) -> u32 {
         colorref(self.r, self.g, self.b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_validation_requires_expected_parent_and_child_style() {
+        let taskbar = HWND(1usize as *mut _);
+        let other = HWND(2usize as *mut _);
+        assert!(embedding_state_is_valid(taskbar, taskbar, WS_CHILD_STYLE));
+        assert!(!embedding_state_is_valid(other, taskbar, WS_CHILD_STYLE));
+        assert!(!embedding_state_is_valid(taskbar, taskbar, WS_POPUP_STYLE));
+    }
+
+    #[test]
+    fn popup_validation_rejects_child_or_parented_windows() {
+        assert!(popup_state_is_valid(HWND::default(), WS_POPUP_STYLE));
+        assert!(!popup_state_is_valid(HWND::default(), WS_CHILD_STYLE));
+        assert!(!popup_state_is_valid(
+            HWND(1usize as *mut _),
+            WS_POPUP_STYLE
+        ));
+    }
+
+    #[test]
+    fn colorref_round_trip_preserves_rgb_channels() {
+        let color = Color::new(12, 34, 56);
+        assert_eq!(Color::from_colorref(color.to_colorref()).r, 12);
+        assert_eq!(Color::from_colorref(color.to_colorref()).g, 34);
+        assert_eq!(Color::from_colorref(color.to_colorref()).b, 56);
     }
 }
