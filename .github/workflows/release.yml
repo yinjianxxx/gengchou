@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -20,8 +22,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: stable
-          components: rustfmt
+          toolchain: 1.86.0
+          components: rustfmt, clippy
 
       - name: Verify tag and binary identity
         shell: pwsh
@@ -47,8 +49,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: Test
         run: cargo test --locked
+
+      - name: Build updater helper test binary
+        run: cargo build --locked
+
+      - name: Test updater helper success hand-off
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\updater_e2e.ps1 -Scenario Success
+
+      - name: Test updater helper child-exit rollback
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\updater_e2e.ps1 -Scenario ChildExit
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -115,7 +133,14 @@ jobs:
           }
           $hashLines | Set-Content -LiteralPath dist\SHA256SUMS -Encoding ascii
 
-      - name: Publish GitHub release
+      - name: Attest release binaries
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/ai-usage-monitor.exe
+            dist/ai-usage-monitor-windows-x64.zip
+
+      - name: Create and verify draft GitHub release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,6 +163,47 @@ jobs:
             dist/DEPENDENCY_LICENSES.md `
             dist/SHA256SUMS `
             --verify-tag `
+            --draft `
             --title "AI Usage Monitor $env:GITHUB_REF_NAME" `
             --notes-file $notesFile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          New-Item -ItemType Directory -Path release-verify -Force | Out-Null
+          gh release download $env:GITHUB_REF_NAME --dir release-verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $verifiedNames = @()
+          foreach ($line in Get-Content -LiteralPath release-verify\SHA256SUMS) {
+            if ($line -notmatch '^(?<hash>[0-9a-fA-F]{64})  (?<name>.+)$') {
+              throw ('Invalid SHA256SUMS line: {0}' -f $line)
+            }
+            $assetPath = Join-Path release-verify $Matches.name
+            if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+              throw ('Downloaded release is missing checksummed asset: {0}' -f $Matches.name)
+            }
+            $actual = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash
+            if ($actual -ne $Matches.hash) {
+              throw ('Downloaded release asset failed SHA-256 verification: {0}' -f $Matches.name)
+            }
+            $verifiedNames += $Matches.name
+          }
+          $requiredVerifiedAssets = @(
+            'ai-usage-monitor.exe',
+            'ai-usage-monitor-windows-x64.zip',
+            'LICENSE',
+            'THIRD_PARTY_NOTICES.md',
+            'DEPENDENCY_LICENSES.md'
+          )
+          foreach ($name in $requiredVerifiedAssets) {
+            if ($name -notin $verifiedNames) {
+              throw ('SHA256SUMS is missing required release asset: {0}' -f $name)
+            }
+          }
+
+          gh attestation verify release-verify\ai-usage-monitor.exe --repo $env:GH_REPO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh attestation verify release-verify\ai-usage-monitor-windows-x64.zip --repo $env:GH_REPO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          gh release edit $env:GITHUB_REF_NAME --draft=false
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

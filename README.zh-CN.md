@@ -19,8 +19,8 @@
 
 </div>
 
-AI Usage Monitor 是一款轻量级原生 Windows 应用，把当前 5 小时和 7 天用量
-放进任务栏组件和每个服务商各自的托盘图标，查配额无需再打开服务商控制台。
+AI Usage Monitor 是一款轻量级原生 Windows 应用，把服务商实际返回的配额窗口
+放进任务栏组件和紧凑托盘图标，查配额无需再打开服务商控制台。
 本项目最初派生自
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)，
 现已独立开发（[项目起源](PROVENANCE.md)）。
@@ -49,7 +49,8 @@ AI Usage Monitor 是一款轻量级原生 Windows 应用，把当前 5 小时和
    `ai-usage-monitor.exe`，放在任意可写目录直接运行。
 
 可执行文件目前未做代码签名；每个 Release 均附带 `SHA256SUMS` 供校验
-下载，应用内更新也会自动核对。
+下载，应用内更新也会自动核对。从 v2.1.0 起，发布资产还带有 GitHub
+artifact attestation，用于证明构建来源，但不能替代 Authenticode 签名。
 
 名称相近的 `CodeZeno.ClaudeCodeUsageMonitor` 是原项目的软件包，不是本应用。
 
@@ -65,37 +66,57 @@ cargo build --release --locked
 
 </details>
 
+发布维护者还应执行[发布检查清单](docs/RELEASE_CHECKLIST.md)。
+
 ## 主要功能
 
-- 实时显示 5 小时和 7 天用量及重置倒计时
+- 实时显示服务商实际返回的额度窗口及重置倒计时
 - Claude Code、Codex、Google Antigravity 可任意组合启用
-- 每个服务商一个紧凑托盘图标：用量数字加 5h / 7d 双用量条
-- 跟随系统主题的详情弹窗，含各服务商状态与精确重置时间
+- 默认启用图标：每个服务商一个紧凑用量图标；也可切换为单个软件图标
+- 跟随系统主题的详情弹窗，含各服务商状态、精确重置时间、实时刷新的轮询倒计时，
+  并可临时解锁移动
+- 可选的长期浮窗，复用紧凑小组件布局，整窗可拖动、跨重启记忆位置、锁定，并可
+  恢复到主显示器工作区右下角
+- 高对比度模式下使用 Windows 系统颜色
 - 可选的重置通知（默认关闭）
 - 在 `explorer.exe` 重启和 RDP / 锁屏切换后自动恢复
+- 锁屏或 RDP 断开时仍按既定间隔轮询；恢复时只重建本地界面，不额外突发请求
 - 支持多显示器、多任务栏
 - 11 种语言 · 无遥测 · 单个约 1 MB 的便携可执行文件
 
 ## 使用方法
 
 - **左键单击**组件或托盘图标，打开或关闭详情弹窗。
-- **右键单击**打开设置菜单：服务商、刷新间隔、通知、开机启动等。
+- 详情弹窗默认可移动；单击锁定按钮可在本次打开期间固定位置，关闭后下次恢复
+  自动定位和可移动状态。
+- **右键单击**组件或托盘图标打开菜单，直接单击**图标**、**小组件**或**浮窗**
+  即可切换。位置重置、浮窗锁定、通知和开机启动等位于**设置**。
+- 展开**刷新**后，可单击顶部的**现在**立即刷新，也可选择自动刷新频率。
 
 ### 任务栏组件
 
 <img src=".github/taskbar-widget.png" alt="嵌入 Windows 任务栏的 AI Usage Monitor 组件">
 
 组件直接嵌入任务栏。拖动左侧分隔线可调整位置；拖到另一条任务栏可切换
-显示器。
+显示器。Explorer 暂时不可用时组件会保持隐藏，不会退回桌面弹窗；任务栏恢复后
+自动重新嵌入。
+
+### 浮窗
+
+浮窗是与任务栏组件、详情弹窗相互独立的长期显示窗口，复用紧凑小组件布局，但绝
+不会自动充当任务栏组件的回退界面。关闭位置锁定后可从整窗任意位置拖动；短按仍
+会打开详情。浮窗不显示任务栏专用的左侧分隔线，并始终位于普通窗口之上。位置会
+跨重启记忆，也可在**设置**中锁定或恢复默认位置。默认位置为主显示器工作区右下角。
 
 ### 托盘图标
 
 <img src=".github/tray-icons.png" alt="Claude Code、Codex 和 Antigravity 托盘图标">
 
-每个已启用的服务商各有一个图标：数字为当前 5 小时用量，下方两条用量条
-分别对应 5 小时（上）和 7 天（下）用量。暂无数据时数字替换为服务商
-首字母，接近上限时切换为警告色。上图由应用自身渲染——运行
-`.\ai-usage-monitor.exe --dump-tray-icons .\preview` 可导出全部图标状态。
+启用**图标**时，每个已启用的服务商各有一个图标；数字和自适应用量条跟随
+接口实际返回的额度窗口。暂无数据时数字替换为服务商首字母，接近上限时切换为
+警告色。关闭该设置后，只保留一个与可执行文件一致的中性软件图标。上图由应用
+自身渲染——运行 `.\ai-usage-monitor.exe --dump-tray-icons .\preview` 可导出
+全部服务商图标状态。
 
 ## 服务商要求
 
@@ -104,7 +125,8 @@ cargo build --release --locked
 
 - **Claude Code** —— 已安装并完成登录（存在可用 WSL 发行版时，
   也会读取 WSL 中的凭据）
-- **Codex** —— 已登录的 Codex CLI 或应用会话
+- **Codex** —— 已登录的 Codex Desktop 或 CLI 会话；如果 Desktop 已保存受支持
+  的本地会话，无需另外安装 CLI
 - **Antigravity** —— 已登录的 Antigravity 会话
 
 ## 数据与隐私
@@ -112,7 +134,7 @@ cargo build --release --locked
 | 内容 | 位置 |
 | --- | --- |
 | 设置 | `%APPDATA%\AIUsageMonitor\settings.json` |
-| 用量缓存——仅百分比和重置时间，绝不含令牌 | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
+| 用量缓存——仅百分比、配额窗口元数据和重置时间，绝不含令牌 | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
 | 诊断日志（只追加、自动轮换） | `%LOCALAPPDATA%\AIUsageMonitor\diagnose.log` |
 
 卸载方法：如启用了**开机启动**请先在菜单中关闭，然后删除可执行文件以及

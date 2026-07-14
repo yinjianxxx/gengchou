@@ -20,8 +20,8 @@
 </div>
 
 AI Usage Monitor is a lightweight native Windows app that puts your current
-5-hour and 7-day usage in a taskbar widget and one tray icon per provider,
-so checking your quota never means opening a dashboard. Originally derived
+provider-reported quota windows in a taskbar widget and compact tray icons, so
+checking your quota never means opening a dashboard. Originally derived
 from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
 it is now developed independently ([provenance](PROVENANCE.md)).
@@ -52,7 +52,9 @@ Installation options, in recommended order:
    folder.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
-download verification, and self-updates check it automatically.
+download verification, and self-updates check it automatically. Starting with
+v2.1.0, release binaries also carry GitHub artifact attestations; these provide
+build provenance but do not replace Authenticode signing.
 
 The similarly named `CodeZeno.ClaudeCodeUsageMonitor` package is the
 original project, not this app.
@@ -69,40 +71,68 @@ cargo build --release --locked
 
 </details>
 
+Release maintainers should also follow the [release checklist](docs/RELEASE_CHECKLIST.md).
+
 ## Features
 
-- Live 5-hour and 7-day usage with reset countdowns
+- Live provider-reported quota windows with reset countdowns
 - Claude Code, Codex, and Google Antigravity — enable any combination
-- One compact tray icon per provider: usage number plus 5h / 7d bars
-- Theme-aware detail popup with per-provider status and exact reset times
+- Icons enabled by default: one compact usage icon per provider, with an
+  optional single app-icon mode
+- Theme-aware detail popup with per-provider status, exact reset times, a
+  live-updating refresh countdown, and an optional temporary move unlock
+- Optional long-lived floating copy of the compact widget, draggable from its
+  whole surface, position-aware across restarts, lockable, and resettable to
+  the primary work area's bottom-right corner
+- Windows system colours in High Contrast mode
 - Optional reset notifications (off by default)
 - Survives `explorer.exe` restarts and RDP / lock-screen transitions
+- Keeps provider polling on its configured cadence while Windows is locked or
+  RDP is disconnected; restoration only rebuilds local UI surfaces
 - Multi-monitor and multi-taskbar aware
 - 11 languages · no telemetry · a single ~1 MB portable executable
 
 ## Usage
 
 - **Left-click** the widget or a tray icon to open or close the detail popup.
-- **Right-click** either one for settings: providers, refresh interval,
-  notifications, start with Windows, and more.
+- The detail popup is movable by default. Use its lock button to fix it in
+  place for the current opening; closing it restores automatic placement and
+  movable mode next time.
+- **Right-click** a widget or tray icon, then click **Icons**, **Widget**, or
+  **Floating Window** directly to toggle it. Position resets, floating-window
+  lock, notifications, and start-with-Windows are under **Settings**.
+- Open **Refresh** to refresh immediately with **Now** or select the automatic
+  polling interval.
 
 ### Taskbar widget
 
 <img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in a Windows taskbar">
 
 The widget embeds directly in the taskbar. Drag it by its left divider to
-reposition it; drop it on another taskbar to change monitors.
+reposition it; drop it on another taskbar to change monitors. If Explorer is
+temporarily unavailable the widget remains hidden instead of appearing on the
+desktop, then re-embeds when the taskbar returns.
+
+### Floating window
+
+The optional floating window is a separate long-lived copy of the compact
+widget, not an automatic fallback for the taskbar widget. While position lock
+is off, drag anywhere on its surface; a short click still opens the detail
+popup. It omits the taskbar-only drag divider and stays above normal windows.
+Its position is remembered across restarts, and **Settings** can lock it or
+restore its default at the bottom-right of the primary work area.
 
 ### Tray icons
 
 <img src=".github/tray-icons.png" alt="Claude Code, Codex, and Antigravity tray icons">
 
-One icon per enabled provider: the number is the current 5-hour usage, and
-the bars underneath track the 5-hour (upper) and 7-day (lower) usage. With
-no data, the number gives way to the provider's initial; near a limit, it
-turns a warning colour. The preview above is rendered by the app — run
-`.\ai-usage-monitor.exe --dump-tray-icons .\preview` to export every icon
-state.
+With **Icons** enabled, one icon appears per enabled provider:
+the number and adaptive bars follow the quota windows that provider actually
+reports. With no data, the number gives way to the provider's initial; near a
+limit, it turns a warning colour. Disable the setting to keep one neutral app
+icon shared with the executable. The preview above is rendered by the app —
+run `.\ai-usage-monitor.exe --dump-tray-icons .\preview` to export every
+provider-icon state.
 
 ## Provider requirements
 
@@ -112,7 +142,8 @@ each provider's own account rules:
 
 - **Claude Code** — installed and signed in (WSL credentials are picked up
   when a usable distribution exists)
-- **Codex** — a signed-in Codex CLI or app session
+- **Codex** — a signed-in Codex Desktop or CLI session; the CLI executable is
+  not required when Desktop has already saved a supported local session
 - **Antigravity** — a signed-in Antigravity session
 
 ## Data & privacy
@@ -120,7 +151,7 @@ each provider's own account rules:
 | What | Where |
 | --- | --- |
 | Settings | `%APPDATA%\AIUsageMonitor\settings.json` |
-| Usage cache — percentages and reset times only, never tokens | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
+| Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
 | Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\AIUsageMonitor\diagnose.log` |
 
 To uninstall: disable **Start with Windows** if you enabled it, then delete
