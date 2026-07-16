@@ -189,7 +189,7 @@ if ($env:OS -ne 'Windows_NT') {
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($HelperPath)) {
-    $HelperPath = Join-Path $repoRoot 'target\debug\ai-usage-monitor.exe'
+    $HelperPath = Join-Path $repoRoot 'target\debug\gengchou.exe'
 }
 $HelperPath = (Resolve-Path -LiteralPath $HelperPath).Path
 if (-not (Test-Path -LiteralPath $HelperPath -PathType Leaf)) {

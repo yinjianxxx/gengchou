@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -21,6 +22,17 @@ const ANTIGRAVITY_TRAY_ICON_ID: u32 = 3;
 const APP_TRAY_ICON_ID: u32 = 4;
 const APP_ICON_RESOURCE_ID: usize = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdentityMode {
+    Guid,
+    LegacyUId,
+}
+
+static CLAUDE_LEGACY_UID: AtomicBool = AtomicBool::new(false);
+static CODEX_LEGACY_UID: AtomicBool = AtomicBool::new(false);
+static ANTIGRAVITY_LEGACY_UID: AtomicBool = AtomicBool::new(false);
+static APP_LEGACY_UID: AtomicBool = AtomicBool::new(false);
 
 const ICON_SIZE: i32 = 64;
 const BAR_LEFT: i32 = 0;
@@ -83,21 +95,58 @@ impl TrayIconKind {
             Self::Antigravity => GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f03),
         }
     }
+
+    fn legacy_uid_flag(self) -> &'static AtomicBool {
+        match self {
+            Self::Claude => &CLAUDE_LEGACY_UID,
+            Self::Codex => &CODEX_LEGACY_UID,
+            Self::Antigravity => &ANTIGRAVITY_LEGACY_UID,
+        }
+    }
+
+    fn identity_mode(self) -> IdentityMode {
+        if self.legacy_uid_flag().load(Ordering::Relaxed) {
+            IdentityMode::LegacyUId
+        } else {
+            IdentityMode::Guid
+        }
+    }
+
+    fn use_legacy_uid(self) {
+        self.legacy_uid_flag().store(true, Ordering::Relaxed);
+    }
 }
 
 fn app_icon_guid() -> GUID {
     GUID::from_u128(0x2b924f36_5cf3_4fcc_8ee7_03eb58e91f00)
 }
 
+fn app_identity_mode() -> IdentityMode {
+    if APP_LEGACY_UID.load(Ordering::Relaxed) {
+        IdentityMode::LegacyUId
+    } else {
+        IdentityMode::Guid
+    }
+}
+
+fn use_legacy_app_uid() {
+    APP_LEGACY_UID.store(true, Ordering::Relaxed);
+}
+
 /// Query the screen rectangle of one of this process's notification icons.
 /// The public Shell API identifies our icons by their shared owner window and
 /// distinct uID values, matching how `ensure` registers them.
 pub fn rect(hwnd: HWND, kind: TrayIconKind) -> Option<RECT> {
+    let mode = kind.identity_mode();
     let identifier = NOTIFYICONIDENTIFIER {
         cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
         hWnd: hwnd,
         uID: kind.id(),
-        guidItem: kind.guid(),
+        guidItem: if mode == IdentityMode::Guid {
+            kind.guid()
+        } else {
+            GUID::zeroed()
+        },
     };
     unsafe { Shell_NotifyIconGetRect(&identifier).ok() }
 }
@@ -443,26 +492,44 @@ pub fn notify_balloon(hwnd: HWND, kind: TrayIconKind, title: &str, message: &str
     }
 }
 
-fn notify_icon_data(hwnd: HWND, kind: TrayIconKind) -> NOTIFYICONDATAW {
-    NOTIFYICONDATAW {
+fn notify_icon_data_for_mode(
+    hwnd: HWND,
+    kind: TrayIconKind,
+    mode: IdentityMode,
+) -> NOTIFYICONDATAW {
+    let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: kind.id(),
-        uFlags: NIF_GUID,
-        guidItem: kind.guid(),
         ..Default::default()
+    };
+    if mode == IdentityMode::Guid {
+        nid.uFlags |= NIF_GUID;
+        nid.guidItem = kind.guid();
     }
+    nid
 }
 
-fn app_notify_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
-    NOTIFYICONDATAW {
+fn notify_icon_data(hwnd: HWND, kind: TrayIconKind) -> NOTIFYICONDATAW {
+    notify_icon_data_for_mode(hwnd, kind, kind.identity_mode())
+}
+
+fn app_notify_icon_data_for_mode(hwnd: HWND, mode: IdentityMode) -> NOTIFYICONDATAW {
+    let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: APP_TRAY_ICON_ID,
-        uFlags: NIF_GUID,
-        guidItem: app_icon_guid(),
         ..Default::default()
+    };
+    if mode == IdentityMode::Guid {
+        nid.uFlags |= NIF_GUID;
+        nid.guidItem = app_icon_guid();
     }
+    nid
+}
+
+fn app_notify_icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    app_notify_icon_data_for_mode(hwnd, app_identity_mode())
 }
 
 /// Copy a string into a fixed-size wide buffer (truncates to fit).
@@ -497,7 +564,23 @@ pub fn ensure(hwnd: HWND, kind: TrayIconKind, percents: &[f64], tooltip: &str) {
         if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
             nid.uFlags |= NIF_MESSAGE;
             nid.uCallbackMessage = WM_APP_TRAY;
-            if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            let mut added = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+            if !added && kind.identity_mode() == IdentityMode::Guid {
+                let mut fallback = notify_icon_data_for_mode(hwnd, kind, IdentityMode::LegacyUId);
+                fallback.uFlags |= NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
+                fallback.uCallbackMessage = WM_APP_TRAY;
+                fallback.hIcon = hicon;
+                copy_to_tip(tooltip, &mut fallback.szTip);
+                if Shell_NotifyIconW(NIM_ADD, &fallback).as_bool() {
+                    kind.use_legacy_uid();
+                    nid = fallback;
+                    added = true;
+                    diagnose::log(format!(
+                        "tray GUID registration failed; using legacy uID kind={kind:?}"
+                    ));
+                }
+            }
+            if added {
                 nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 if !Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool() {
                     diagnose::log(format!(
@@ -574,7 +657,21 @@ fn ensure_app(hwnd: HWND, tooltip: &str) {
         if !Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool() {
             nid.uFlags |= NIF_MESSAGE;
             nid.uCallbackMessage = WM_APP_TRAY;
-            if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            let mut added = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+            if !added && app_identity_mode() == IdentityMode::Guid {
+                let mut fallback = app_notify_icon_data_for_mode(hwnd, IdentityMode::LegacyUId);
+                fallback.uFlags |= NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
+                fallback.uCallbackMessage = WM_APP_TRAY;
+                fallback.hIcon = hicon;
+                copy_to_tip(tooltip, &mut fallback.szTip);
+                if Shell_NotifyIconW(NIM_ADD, &fallback).as_bool() {
+                    use_legacy_app_uid();
+                    nid = fallback;
+                    added = true;
+                    diagnose::log("app tray GUID registration failed; using legacy uID");
+                }
+            }
+            if added {
                 nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 if !Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool() {
                     diagnose::log("app tray icon version negotiation failed");
@@ -707,6 +804,35 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    #[test]
+    fn provider_identity_mode_preserves_uid_and_only_guid_mode_sets_nif_guid() {
+        let guid =
+            notify_icon_data_for_mode(HWND::default(), TrayIconKind::Claude, IdentityMode::Guid);
+        let legacy = notify_icon_data_for_mode(
+            HWND::default(),
+            TrayIconKind::Claude,
+            IdentityMode::LegacyUId,
+        );
+
+        assert_eq!(guid.uID, CLAUDE_TRAY_ICON_ID);
+        assert_eq!(legacy.uID, CLAUDE_TRAY_ICON_ID);
+        assert_ne!(guid.uFlags.0 & NIF_GUID.0, 0);
+        assert_eq!(legacy.uFlags.0 & NIF_GUID.0, 0);
+        assert_eq!(legacy.guidItem, GUID::zeroed());
+    }
+
+    #[test]
+    fn app_identity_mode_preserves_uid_and_only_guid_mode_sets_nif_guid() {
+        let guid = app_notify_icon_data_for_mode(HWND::default(), IdentityMode::Guid);
+        let legacy = app_notify_icon_data_for_mode(HWND::default(), IdentityMode::LegacyUId);
+
+        assert_eq!(guid.uID, APP_TRAY_ICON_ID);
+        assert_eq!(legacy.uID, APP_TRAY_ICON_ID);
+        assert_ne!(guid.uFlags.0 & NIF_GUID.0, 0);
+        assert_eq!(legacy.uFlags.0 & NIF_GUID.0, 0);
+        assert_eq!(legacy.guidItem, GUID::zeroed());
     }
 
     #[test]

@@ -16,7 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
-const RELEASE_ASSET_NAME: &str = "ai-usage-monitor.exe";
+const RELEASE_ASSET_NAME: &str = "gengchou.exe";
+#[cfg(test)]
+const LEGACY_RELEASE_ASSET_NAME: &str = "ai-usage-monitor.exe";
 // Fixed asset produced by .github/workflows/release.yml; self-updates refuse
 // to apply a download whose SHA-256 does not match this manifest.
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
@@ -41,7 +43,7 @@ const MAX_CHECKSUM_MANIFEST_BYTES: u64 = 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 // Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "yinjianxxx.AIUsageMonitor";
+const WINGET_PACKAGE_ID: &str = "yinjianxxx.Gengchou";
 
 static UPDATE_READY_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
@@ -412,9 +414,13 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
 }
 
 fn exact_release_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    release_asset_named(assets, RELEASE_ASSET_NAME)
+}
+
+fn release_asset_named<'a>(assets: &'a [GitHubAsset], name: &str) -> Option<&'a GitHubAsset> {
     assets
         .iter()
-        .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET_NAME))
+        .find(|asset| asset.name.eq_ignore_ascii_case(name))
 }
 
 fn build_agent() -> Result<ureq::Agent, String> {
@@ -1185,21 +1191,22 @@ fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
             "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} ",
             "catch {{ ",
             "$running = Get-Process -Id $pidToWait -ErrorAction SilentlyContinue; ",
-            "if ($null -ne $running) {{ Write-Error 'Timed out waiting for AI Usage Monitor to exit; WinGet was not started.'; exit 20 }} ",
+            "if ($null -ne $running) {{ Write-Error 'Timed out waiting for Gengchou to exit; WinGet was not started.'; exit 20 }} ",
             "}} ",
             "}}; ",
             "winget upgrade --id {package_id} --exact; ",
             "$exitCode = $LASTEXITCODE; ",
             "if ($exitCode -eq 0) {{ ",
             "Start-Sleep -Seconds 2; ",
-            "$installed = Get-Command ai-usage-monitor -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; ",
+            "$installed = Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; ",
+            "if ($null -eq $installed) {{ $installed = Get-Command ai-usage-monitor -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }}; ",
             "if ($null -ne $installed) {{ ",
             "$restartTarget = $installed.Source; ",
             "$restartDir = Split-Path -Parent $restartTarget ",
             "}} elseif (Test-Path -LiteralPath $target -PathType Leaf) {{ ",
             "$restartTarget = $target; $restartDir = $workingDir ",
             "}} else {{ ",
-            "Write-Error 'WinGet completed, but the updated AI Usage Monitor command could not be located.'; exit 21 ",
+            "Write-Error 'WinGet completed, but the updated Gengchou command could not be located.'; exit 21 ",
             "}}; ",
             "Start-Process -FilePath $restartTarget -WorkingDirectory $restartDir; ",
             "exit 0 ",
@@ -1430,8 +1437,8 @@ mod tests {
 
     #[test]
     fn manifest_lookup_finds_the_exe_entry() {
-        let manifest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  ai-usage-monitor.exe\n\
-                        fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  ai-usage-monitor-windows-x64.zip\n";
+        let manifest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  gengchou.exe\n\
+                        fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210  gengchou-windows-x64.zip\n";
         assert_eq!(
             expected_checksum_from_manifest(manifest, RELEASE_ASSET_NAME).as_deref(),
             Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
@@ -1454,13 +1461,13 @@ mod tests {
         );
         // Truncated hash.
         assert_eq!(
-            expected_checksum_from_manifest("abc123  ai-usage-monitor.exe", RELEASE_ASSET_NAME),
+            expected_checksum_from_manifest("abc123  gengchou.exe", RELEASE_ASSET_NAME),
             None
         );
         // Correct length but not hexadecimal.
         assert_eq!(
             expected_checksum_from_manifest(
-                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  ai-usage-monitor.exe",
+                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  gengchou.exe",
                 RELEASE_ASSET_NAME
             ),
             None
@@ -1482,6 +1489,40 @@ mod tests {
         assert_eq!(
             exact_release_asset(&exact).map(|asset| asset.browser_download_url.as_str()),
             Some("https://example.invalid/app.exe")
+        );
+    }
+
+    #[test]
+    fn dual_asset_release_selects_the_new_binary_and_checksum() {
+        let assets = [
+            GitHubAsset {
+                name: LEGACY_RELEASE_ASSET_NAME.to_string(),
+                browser_download_url: "https://example.invalid/legacy.exe".to_string(),
+            },
+            GitHubAsset {
+                name: RELEASE_ASSET_NAME.to_string(),
+                browser_download_url: "https://example.invalid/gengchou.exe".to_string(),
+            },
+        ];
+        assert_eq!(
+            exact_release_asset(&assets).map(|asset| asset.browser_download_url.as_str()),
+            Some("https://example.invalid/gengchou.exe")
+        );
+        assert_eq!(
+            release_asset_named(&assets, LEGACY_RELEASE_ASSET_NAME)
+                .map(|asset| asset.browser_download_url.as_str()),
+            Some("https://example.invalid/legacy.exe")
+        );
+
+        let manifest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ai-usage-monitor.exe\n\
+                        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gengchou.exe\n";
+        assert_eq!(
+            expected_checksum_from_manifest(manifest, RELEASE_ASSET_NAME).as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            expected_checksum_from_manifest(manifest, LEGACY_RELEASE_ASSET_NAME).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
@@ -1720,6 +1761,9 @@ mod tests {
     #[test]
     fn winget_restart_prefers_the_new_portable_command_alias() {
         let command = winget_upgrade_command(123, r"C:\old-version\app.exe", r"C:\old-version");
+        assert!(command.contains(
+            "Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue"
+        ));
         assert!(command.contains(
             "Get-Command ai-usage-monitor -CommandType Application -ErrorAction SilentlyContinue"
         ));
