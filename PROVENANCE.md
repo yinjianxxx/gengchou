@@ -1,11 +1,14 @@
 # Provenance
 
-AI Usage Monitor is originally derived from
+Gengchou is originally derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
 based on v1.4.8 (commit `9b29972`). The project's initial goal was to survive
 Microsoft Remote Desktop transitions and explorer.exe taskbar rebuilds without
 crashing or permanently losing the embedded widget; it has since developed
-independently.
+independently. The independent project was initially released as AI Usage
+Monitor and adopted the Gengchou name on the 2.2.x line. The rename changes
+the public product identity while deliberately retaining internal Windows
+identity values so existing installations continue to use the same data.
 
 ## Relationship to the original project
 
@@ -16,16 +19,16 @@ independently.
 
 ## Identity isolation
 
-| Item | CodeZeno original | AI Usage Monitor |
+| Item | CodeZeno original | Gengchou (formerly AI Usage Monitor) |
 |---|---|---|
-| Package and EXE | claude-code-usage-monitor | ai-usage-monitor |
+| Package and EXE | claude-code-usage-monitor | gengchou |
 | Version line | 1.4.x | 2.x |
-| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\AIUsageMonitor |
-| Window class | ClaudeCodeUsageMonitor | AIUsageMonitor |
-| Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\AIUsageMonitor |
-| Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\AIUsageMonitor\diagnose.log |
-| Updates | Upstream GitHub Releases | This project's GitHub Releases and independent EXE asset |
-| Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\AIUsageMonitor\updates |
+| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\AIUsageMonitor (retained) |
+| Window class | ClaudeCodeUsageMonitor | AIUsageMonitor (retained) |
+| Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\AIUsageMonitor (retained) |
+| Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\AIUsageMonitor\diagnose.log (retained) |
+| Updates | Upstream GitHub Releases | Gengchou GitHub Releases and independent EXE asset |
+| Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\AIUsageMonitor\updates (retained) |
 
 ## Stability changes
 
@@ -56,7 +59,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-Release binary: `target/release/ai-usage-monitor.exe`.
+Release binary: `target/release/gengchou.exe`.
 
 ## License
 

@@ -14,13 +14,13 @@ version once a fix is available.
 ## Reporting a vulnerability
 
 Please do not disclose a suspected vulnerability in a public issue. Use
-[GitHub's private vulnerability reporting form](https://github.com/yinjianxxx/ai-usage-monitor/security/advisories/new)
+[GitHub's private vulnerability reporting form](https://github.com/yinjianxxx/gengchou/security/advisories/new)
 instead. If the form is unavailable, open a public issue containing no
 security details and ask the maintainer for a private contact channel.
 
 Include, when possible:
 
-- the affected AI Usage Monitor version and Windows version;
+- the affected Gengchou version and Windows version;
 - a concise description of the impact and the conditions required to trigger it;
 - reproducible steps or a minimal proof of concept;
 - whether credential handling, the self-updater, startup persistence, or file
@@ -33,5 +33,5 @@ basis; the maintainer will coordinate disclosure after the issue and a safe
 upgrade path have been assessed.
 
 Provider outages, account access, quota calculations, billing, and upstream
-API behavior are normally outside this project's security scope unless AI
-Usage Monitor introduces an additional vulnerability.
+API behavior are normally outside this project's security scope unless
+Gengchou introduces an additional vulnerability.

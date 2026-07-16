@@ -4,13 +4,15 @@
 
 <div align="center">
 
-# AI Usage Monitor
+# Gengchou
 
-**Claude Code · Codex · Antigravity usage, right on the Windows taskbar.**
+**AI quota at a glance.**
+
+<sub>AI usage monitor for the Windows taskbar · Formerly AI Usage Monitor</sub>
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![CI](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/ai-usage-monitor/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/yinjianxxx/ai-usage-monitor)](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest)
+[![CI](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/yinjianxxx/gengchou)](https://github.com/yinjianxxx/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <img src=".github/screenshot.png" alt="Detail popup showing Claude Code, Codex, and Antigravity usage with reset times" width="480">
@@ -19,10 +21,10 @@
 
 </div>
 
-AI Usage Monitor is a lightweight native Windows app that puts your current
+Gengchou is a lightweight native Windows app that puts your current
 provider-reported quota windows in a taskbar widget and compact tray icons, so
-checking your quota never means opening a dashboard. Originally derived
-from
+checking your quota never means opening a dashboard. Formerly AI Usage Monitor,
+it keeps the same settings and update path across the rename. Originally derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
 it is now developed independently ([provenance](PROVENANCE.md)).
 
@@ -30,25 +32,25 @@ it is now developed independently ([provenance](PROVENANCE.md)).
 
 Installation options, in recommended order:
 
-1. **WinGet (preferred when available).** The initial package status is tracked
-   in [microsoft/winget-pkgs#400395](https://github.com/microsoft/winget-pkgs/pull/400395).
-   Try:
+1. **WinGet (preferred when available).** Gengchou uses a new package identity;
+   the former AI Usage Monitor package was never published to WinGet. Once the
+   new package is available, install it with:
 
    ```powershell
-   winget install --id yinjianxxx.AIUsageMonitor --exact
+   winget install --id yinjianxxx.Gengchou --exact
    ```
 
-   If WinGet does not find `yinjianxxx.AIUsageMonitor` yet, use the ZIP below.
+   If WinGet does not find `yinjianxxx.Gengchou` yet, use the ZIP below.
 
 2. **Portable ZIP (recommended manual download).** Download
-   `ai-usage-monitor-windows-x64.zip` from the
-   [latest release](https://github.com/yinjianxxx/ai-usage-monitor/releases/latest),
+   `gengchou-windows-x64.zip` from the
+   [latest release](https://github.com/yinjianxxx/gengchou/releases/latest),
    extract it to any folder you can write to, and run
-   `ai-usage-monitor.exe`. The bundle includes both READMEs and the retained
+   `gengchou.exe`. The bundle includes both READMEs and the retained
    license and attribution notices.
 
 3. **Standalone EXE.** For a single-file download, get
-   `ai-usage-monitor.exe` from the same release and run it from any writable
+   `gengchou.exe` from the same release and run it from any writable
    folder.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
@@ -63,10 +65,10 @@ original project, not this app.
 <summary><b>Build from source</b> (Windows 10/11, stable Rust)</summary>
 
 ```powershell
-git clone https://github.com/yinjianxxx/ai-usage-monitor.git
-cd ai-usage-monitor
+git clone https://github.com/yinjianxxx/gengchou.git
+cd gengchou
 cargo build --release --locked
-.\target\release\ai-usage-monitor.exe
+.\target\release\gengchou.exe
 ```
 
 </details>
@@ -106,7 +108,7 @@ Release maintainers should also follow the [release checklist](docs/RELEASE_CHEC
 
 ### Taskbar widget
 
-<img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in a Windows taskbar">
+<img src=".github/taskbar-widget.png" alt="Gengchou widget embedded in a Windows taskbar">
 
 The widget embeds directly in the taskbar. Each provider gets a content-sized,
 single-line badge with its logo, quota-window label, and short-window usage.
@@ -138,7 +140,7 @@ the number and adaptive bars follow the quota windows that provider actually
 reports. With no data, the number gives way to the provider's initial; near a
 limit, it turns a warning colour. Disable the setting to keep one neutral app
 icon shared with the executable. The preview above is rendered by the app —
-run `.\ai-usage-monitor.exe --dump-tray-icons .\preview` to export every
+run `.\gengchou.exe --dump-tray-icons .\preview` to export every
 provider-icon state.
 
 ## Provider requirements
@@ -160,6 +162,10 @@ each provider's own account rules:
 | Settings | `%APPDATA%\AIUsageMonitor\settings.json` |
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
 | Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\AIUsageMonitor\diagnose.log` |
+
+The legacy `AIUsageMonitor` directory name is intentionally retained so an
+upgrade to Gengchou keeps existing settings, cache, diagnostics, and startup
+behavior without migration.
 
 To uninstall: disable **Start with Windows** if you enabled it, then delete
 the executable, `%APPDATA%\AIUsageMonitor`, and

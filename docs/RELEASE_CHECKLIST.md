@@ -11,6 +11,9 @@ with a short note in the release runbook.
 - `cargo test --locked`
 - updater helper E2E: `Success` and `ChildExit`
 - `cargo build --release --locked`
+- Confirm the built file is `target/release/gengchou.exe`; inspect PE properties
+  for ProductName `Gengchou`, version/tag agreement, retained upstream
+  copyright/Comments, and the unchanged v2.1.0 application icon.
 - Debug compact-surface gate: `cargo run --locked -- --dump-widget
   tmp/compact-release-check`; inspect every generated theme, warning/error,
   High Contrast, tooltip, and mixed-digit alignment fixture.
@@ -85,7 +88,7 @@ with a short note in the release runbook.
   legible; warning row text must remain visible on the window canvas and every
   character inside warning/error pills must contrast with the highlight fill.
 - Retake `.github/screenshot.png`, `.github/taskbar-widget.png`, and
-  `.github/tray-icons.png` from the final v2.1.0 build; verify the README text,
+  `.github/tray-icons.png` from the final Gengchou build; verify the README text,
   alt text, provider marks, compact layout, and displayed version match.
 - With Codex Desktop signed in and the CLI absent or unavailable, confirm Codex
   usage still loads from a supported local session.
@@ -95,7 +98,17 @@ with a short note in the release runbook.
 - Verify a portable update releases the old PID and single-instance mutex,
   replaces the target, starts one new PID, and preserves the rollback backup
   until the new process reports ready.
-- Verify the WinGet path on an installed build when the package update exists.
+- Run AI Usage Monitor from its old path, exit it, then start `gengchou.exe`
+  from a different path. Confirm the app/provider tray icons remain visible,
+  update correctly, handle clicks/menus, survive Explorer restart, and are
+  removed cleanly even if Windows rejects the retained GUID and the app falls
+  back to its `uID` identity.
+- Confirm the draft release has exactly eight attachments: new and legacy EXE
+  and ZIP names, three compliance files, and `SHA256SUMS`. The manifest must
+  cover all seven payload assets, and all four EXE/ZIP assets must have build
+  provenance attestations.
+- Verify the WinGet path with `yinjianxxx.Gengchou` on an installed build when
+  the new package update exists; do not test the unpublished former ID.
 - Confirm the draft release re-download passes `SHA256SUMS` and GitHub
   attestation verification before the workflow publishes it.
 - Confirm release notes mention any one-time migration, including notification
