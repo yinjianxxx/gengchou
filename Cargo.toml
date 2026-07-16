@@ -1,22 +1,22 @@
 [package]
-name = "ai-usage-monitor"
+name = "gengchou"
 # Versioning starts at 2.x, above the original project's 1.x line: also
 # guarantees the manual update check never treats an upstream 1.x release as
 # newer (see updater::is_version_newer).
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
-description = "Windows taskbar and tray usage monitor for Claude Code, Codex, and Antigravity"
-homepage = "https://github.com/yinjianxxx/ai-usage-monitor"
-repository = "https://github.com/yinjianxxx/ai-usage-monitor"
+description = "Gengchou — AI usage monitor for the Windows taskbar"
+homepage = "https://github.com/yinjianxxx/gengchou"
+repository = "https://github.com/yinjianxxx/gengchou"
 
 [package.metadata.winres]
 CompanyName = "yinjianxxx"
-ProductName = "AI Usage Monitor"
-FileDescription = "AI Usage Monitor"
-OriginalFilename = "ai-usage-monitor.exe"
-InternalName = "AIUsageMonitor"
+ProductName = "Gengchou"
+FileDescription = "Gengchou — AI quota monitor"
+OriginalFilename = "gengchou.exe"
+InternalName = "Gengchou"
 Comments = "Originally derived from CodeZeno/Claude-Code-Usage-Monitor"
 LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 yinjianxxx"
 

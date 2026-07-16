@@ -2463,7 +2463,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
     let state = lock_state();
     let Some(s) = state.as_ref() else {
         return DetailPopupState {
-            title: "AI Usage Monitor".to_string(),
+            title: "Gengchou".to_string(),
             providers: Vec::new(),
             status: LanguageId::English.strings().detail_waiting.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -3274,7 +3274,7 @@ pub fn dump_detail_popup(dir: &str) -> i32 {
         warn: compact_view::display_percent(percent) >= compact_view::WARN_THRESHOLD_PERCENT,
     };
     let snapshot = DetailPopupState {
-        title: "AI Usage Monitor".to_string(),
+        title: "Gengchou".to_string(),
         providers: vec![
             DetailProviderGroup {
                 kind: tray_icon::TrayIconKind::Claude,
@@ -4205,7 +4205,7 @@ fn paint_detail_popup(hdc: HDC, hwnd: HWND) {
     let snapshot = {
         let detail_state = lock_detail_state();
         detail_state.clone().unwrap_or_else(|| DetailPopupState {
-            title: "AI Usage Monitor".to_string(),
+            title: "Gengchou".to_string(),
             providers: Vec::new(),
             status: LanguageId::English.strings().detail_waiting.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -9966,7 +9966,7 @@ mod reset_notification_tests {
             rows: vec![row.clone(), row],
         };
         let snapshot = DetailPopupState {
-            title: "AI Usage Monitor".to_string(),
+            title: "Gengchou".to_string(),
             providers: vec![group.clone()],
             status: "Updated now".to_string(),
             version: "test".to_string(),

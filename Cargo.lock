@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "ai-usage-monitor"
-version = "2.1.0"
-dependencies = [
- "dirs",
- "native-tls",
- "serde",
- "serde_json",
- "ureq",
- "windows",
- "winres",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,6 +140,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "gengchou"
+version = "2.2.0"
+dependencies = [
+ "dirs",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "ureq",
+ "windows",
+ "winres",
 ]
 
 [[package]]

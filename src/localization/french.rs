@@ -3,7 +3,7 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Mettre à jour avec WinGet";
 
 pub(super) const STRINGS: Strings = Strings {
-    window_title: "AI Usage Monitor",
+    window_title: "Gengchou",
     refresh: "Actualiser",
     refresh_now: "Maintenant",
     one_minute: "1 minute",
