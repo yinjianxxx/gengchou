@@ -26,6 +26,8 @@ const CLAUDE_RATE_LIMIT_MAX_RETRY_MS: u32 = 3_600_000;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
+const ANTIGRAVITY_USER_QUOTA_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
@@ -150,7 +152,31 @@ struct AntigravityQuotaInfo {
 }
 
 #[derive(Deserialize)]
+struct AntigravityUserQuotaResponse {
+    #[serde(default)]
+    buckets: Vec<AntigravityUserQuotaBucket>,
+}
+
+#[derive(Deserialize)]
+struct AntigravityUserQuotaBucket {
+    #[serde(rename = "modelId")]
+    model_id: Option<String>,
+    #[serde(rename = "remainingFraction")]
+    remaining_fraction: Option<f64>,
+    #[serde(rename = "resetTime")]
+    reset_time: Option<String>,
+    disabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
 struct AntigravityQuotaSummaryResponse {
+    groups: Option<Vec<AntigravityQuotaSummaryGroup>>,
+    #[serde(rename = "quotaSummary")]
+    quota_summary: Option<AntigravityQuotaSummaryEnvelope>,
+}
+
+#[derive(Deserialize)]
+struct AntigravityQuotaSummaryEnvelope {
     groups: Option<Vec<AntigravityQuotaSummaryGroup>>,
 }
 
@@ -927,17 +953,73 @@ fn fetch_antigravity_usage_from_endpoint(
 ) -> Result<UsageData, PollError> {
     let project = fetch_antigravity_project(base_url, token)?;
     if let Some(project) = project.as_deref() {
-        match fetch_antigravity_quota_summary(base_url, token, project) {
-            Ok(data) => return Ok(data),
-            Err(PollError::AuthRequired) => return Err(PollError::AuthRequired),
-            Err(error) => diagnose::log(format!(
-                "Antigravity retrieveUserQuotaSummary failed, falling back to model quota: {error:?}"
-            )),
+        let per_model = match fetch_antigravity_user_quota(token, project) {
+            Ok(data) if !data.is_empty() => Some(data),
+            Ok(_) => None,
+            Err(error) => {
+                diagnose::log(format!(
+                    "Antigravity retrieveUserQuota unavailable; continuing with weekly summary: {error:?}"
+                ));
+                None
+            }
+        };
+        let summary = match fetch_antigravity_quota_summary(base_url, token, project) {
+            Ok(data) if !data.is_empty() => Some(data),
+            Ok(_) => None,
+            Err(error) => {
+                diagnose::log(format!(
+                    "Antigravity retrieveUserQuotaSummary unavailable; continuing with per-model quota: {error:?}"
+                ));
+                None
+            }
+        };
+
+        if let Some(data) = merge_antigravity_usage_sources(per_model, summary) {
+            return Ok(data);
         }
     }
 
     let window = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
     Ok(UsageData::from_windows(vec![window]))
+}
+
+fn fetch_antigravity_user_quota(token: &str, project: &str) -> Result<UsageData, PollError> {
+    let agent = build_agent()?;
+    let body = serde_json::json!({ "project": project });
+
+    let resp = match agent
+        .post(ANTIGRAVITY_USER_QUOTA_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "antigravity")
+        .send_json(&body)
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, response)) => {
+            return Err(http_status_poll_error(
+                "Antigravity retrieveUserQuota",
+                code,
+                &response,
+            ));
+        }
+        Err(error) => {
+            diagnose::log_error("Antigravity retrieveUserQuota request failed", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    let response: AntigravityUserQuotaResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log_error(
+                "unable to parse Antigravity retrieveUserQuota response",
+                error,
+            );
+            return Err(PollError::RequestFailed);
+        }
+    };
+
+    Ok(antigravity_usage_from_user_quota(response).unwrap_or_default())
 }
 
 fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
@@ -1085,11 +1167,45 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageWi
     ))
 }
 
+fn antigravity_usage_from_user_quota(response: AntigravityUserQuotaResponse) -> Option<UsageData> {
+    let window = best_antigravity_section(response.buckets.into_iter().filter_map(|bucket| {
+        if bucket.disabled.unwrap_or(false) {
+            return None;
+        }
+        let model = bucket.model_id?.trim().to_ascii_lowercase();
+        let model = model.strip_prefix("models/").unwrap_or(&model);
+        if !is_antigravity_display_model(model) {
+            return None;
+        }
+        let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
+        Some(UsageWindow::new(
+            (1.0 - remaining) * 100.0,
+            parse_iso8601(bucket.reset_time.as_deref()),
+            Some(FIVE_HOURS_SECONDS),
+        ))
+    }))?;
+
+    Some(UsageData::from_windows(vec![window]))
+}
+
+fn merge_antigravity_usage_sources(
+    per_model: Option<UsageData>,
+    summary: Option<UsageData>,
+) -> Option<UsageData> {
+    let mut windows = Vec::new();
+    for usage in [per_model, summary].into_iter().flatten() {
+        for window in usage.windows {
+            upsert_usage_window(&mut windows, window);
+        }
+    }
+    (!windows.is_empty()).then(|| UsageData::from_windows(windows))
+}
+
 fn antigravity_section_from_summary_bucket(
     bucket: &AntigravityQuotaSummaryBucket,
 ) -> Option<UsageWindow> {
     let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
-    let duration_seconds = usage_window_duration_seconds(bucket.window.as_deref());
+    let duration_seconds = antigravity_summary_bucket_duration_seconds(bucket);
     let source_label = duration_seconds.is_none().then(|| {
         bucket
             .window
@@ -1107,10 +1223,49 @@ fn antigravity_section_from_summary_bucket(
     )
 }
 
+fn antigravity_summary_bucket_duration_seconds(
+    bucket: &AntigravityQuotaSummaryBucket,
+) -> Option<u64> {
+    if let Some(seconds) = usage_window_duration_seconds(bucket.window.as_deref()) {
+        return Some(seconds);
+    }
+
+    let text = format!(
+        "{} {}",
+        bucket.bucket_id.as_deref().unwrap_or_default(),
+        bucket.display_name.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    let words = text
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+
+    if words
+        .iter()
+        .any(|word| matches!(*word, "weekly" | "week" | "7d" | "1w"))
+    {
+        return Some(ONE_WEEK_SECONDS);
+    }
+    if words.iter().any(|word| *word == "5h")
+        || words
+            .windows(2)
+            .any(|pair| pair == ["five", "hour"] || pair == ["5", "hour"])
+    {
+        return Some(FIVE_HOURS_SECONDS);
+    }
+
+    None
+}
+
 fn antigravity_usage_from_summary(response: AntigravityQuotaSummaryResponse) -> Option<UsageData> {
     let mut fallback = None;
 
-    for group in response.groups.unwrap_or_default() {
+    let groups = response
+        .groups
+        .or_else(|| response.quota_summary.and_then(|summary| summary.groups))
+        .unwrap_or_default();
+    for group in groups {
         let is_gemini = is_antigravity_gemini_summary_group(&group);
         let usage = antigravity_usage_from_summary_group(group);
 
@@ -2127,6 +2282,139 @@ mod tests {
             .windows
             .iter()
             .all(|window| window.resets_at.is_some()));
+    }
+
+    #[test]
+    fn antigravity_user_quota_collapses_models_into_the_most_used_five_hour_window() {
+        let response: AntigravityUserQuotaResponse = serde_json::from_str(
+            r#"{
+                "buckets": [
+                    {
+                        "modelId": "models/gemini-3.5-flash-high",
+                        "remainingFraction": 0.8,
+                        "resetTime": "2026-06-13T22:08:54Z"
+                    },
+                    {
+                        "modelId": "claude-opus",
+                        "remainingFraction": 0.25,
+                        "resetTime": "2026-06-13T22:18:54Z"
+                    },
+                    {
+                        "modelId": "tab-completion",
+                        "remainingFraction": 0.0,
+                        "resetTime": "2026-06-13T22:18:54Z"
+                    },
+                    {
+                        "modelId": "gpt-disabled",
+                        "remainingFraction": 0.0,
+                        "resetTime": "2026-06-13T22:18:54Z",
+                        "disabled": true
+                    }
+                ]
+            }"#,
+        )
+        .expect("user quota response should deserialize");
+
+        let usage = antigravity_usage_from_user_quota(response)
+            .expect("a supported per-model quota should be selected");
+
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].duration_seconds, Some(FIVE_HOURS_SECONDS));
+        assert!((usage.windows[0].percentage - 75.0).abs() < f64::EPSILON);
+        assert!(usage.windows[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn antigravity_sources_merge_five_hour_and_weekly_windows() {
+        let per_model =
+            UsageData::from_windows(vec![UsageWindow::new(35.0, None, Some(FIVE_HOURS_SECONDS))]);
+        let summary =
+            UsageData::from_windows(vec![UsageWindow::new(12.0, None, Some(ONE_WEEK_SECONDS))]);
+
+        let merged = merge_antigravity_usage_sources(Some(per_model), Some(summary))
+            .expect("both quota sources should merge");
+
+        assert_eq!(merged.windows.len(), 2);
+        assert_eq!(merged.windows[0].duration_seconds, Some(FIVE_HOURS_SECONDS));
+        assert_eq!(merged.windows[1].duration_seconds, Some(ONE_WEEK_SECONDS));
+        assert_eq!(merged.windows[0].percentage, 35.0);
+        assert_eq!(merged.windows[1].percentage, 12.0);
+    }
+
+    #[test]
+    fn antigravity_sources_keep_weekly_only_free_plan_without_inventing_five_hour() {
+        let summary =
+            UsageData::from_windows(vec![UsageWindow::new(7.0, None, Some(ONE_WEEK_SECONDS))]);
+
+        let merged = merge_antigravity_usage_sources(None, Some(summary))
+            .expect("weekly-only usage should remain usable");
+
+        assert_eq!(merged.windows.len(), 1);
+        assert_eq!(merged.windows[0].duration_seconds, Some(ONE_WEEK_SECONDS));
+    }
+
+    #[test]
+    fn antigravity_sources_dedupe_legacy_summary_five_hour_bucket() {
+        let per_model =
+            UsageData::from_windows(vec![UsageWindow::new(40.0, None, Some(FIVE_HOURS_SECONDS))]);
+        let summary = UsageData::from_windows(vec![
+            UsageWindow::new(20.0, None, Some(FIVE_HOURS_SECONDS)),
+            UsageWindow::new(8.0, None, Some(ONE_WEEK_SECONDS)),
+        ]);
+
+        let merged = merge_antigravity_usage_sources(Some(per_model), Some(summary))
+            .expect("legacy duplicate windows should merge");
+
+        assert_eq!(merged.windows.len(), 2);
+        assert_eq!(merged.windows[0].percentage, 40.0);
+        assert_eq!(merged.windows[1].percentage, 8.0);
+    }
+
+    #[test]
+    fn antigravity_summary_accepts_nested_quota_summary_envelope() {
+        let response: AntigravityQuotaSummaryResponse = serde_json::from_str(
+            r#"{
+                "quotaSummary": {
+                    "groups": [
+                        {
+                            "displayName": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "bucketId": "gemini-weekly",
+                                    "displayName": "Weekly Quota",
+                                    "remainingFraction": 0.6,
+                                    "resetTime": "2026-06-20T17:08:54Z"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("nested summary response should deserialize");
+
+        let usage = antigravity_usage_from_summary(response)
+            .expect("nested weekly quota should be selected");
+
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].duration_seconds, Some(ONE_WEEK_SECONDS));
+        assert!((usage.windows[0].percentage - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn antigravity_summary_infers_five_hour_window_without_explicit_window_field() {
+        let bucket = AntigravityQuotaSummaryBucket {
+            bucket_id: Some("gemini-5h".to_string()),
+            display_name: Some("Five Hour Quota".to_string()),
+            window: None,
+            remaining_fraction: Some(0.5),
+            reset_time: None,
+        };
+
+        assert_eq!(
+            antigravity_summary_bucket_duration_seconds(&bucket),
+            Some(FIVE_HOURS_SECONDS)
+        );
     }
 
     #[test]
