@@ -1,5 +1,7 @@
 #![windows_subsystem = "windows"]
 
+mod compact_layout;
+mod compact_view;
 mod diagnose;
 mod localization;
 mod models;
@@ -41,6 +43,29 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| ".".to_string());
         std::process::exit(tray_icon::dump_icons(&dir));
+    }
+
+    // Diagnostic: render the detail popup with representative data to a BMP
+    // and exit. Used to eyeball popup layout changes.
+    if let Some(pos) = args.iter().position(|arg| arg == "--dump-detail-popup") {
+        let dir = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| ".".to_string());
+        std::process::exit(window::dump_detail_popup(&dir));
+    }
+
+    // Diagnostic: render both compact surfaces with representative data and
+    // exit. This is the fast visual gate before launching a live Debug build.
+    if let Some(pos) = args
+        .iter()
+        .position(|arg| arg == "--dump-widget" || arg == "--dump-compact-surfaces")
+    {
+        let dir = args
+            .get(pos + 1)
+            .cloned()
+            .unwrap_or_else(|| ".".to_string());
+        std::process::exit(window::dump_widget(&dir));
     }
 
     diagnose::log("entering window::run");

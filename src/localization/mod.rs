@@ -173,7 +173,6 @@ pub struct Strings {
     pub exit: &'static str,
     pub show_widget: &'static str,
     pub show_floating_monitor: &'static str,
-    pub lock_floating_position: &'static str,
     pub detailed_tray_icons: &'static str,
     pub notifications: &'static str,
     pub notify_session_reset: &'static str,
@@ -213,6 +212,10 @@ pub struct Strings {
     pub detail_badge_rate_limited: &'static str,
     pub detail_badge_error: &'static str,
     pub detail_badge_loading: &'static str,
+    pub detail_badge_near_limit: &'static str,
+    pub detail_badge_normal: &'static str,
+    pub detail_badge_unused: &'static str,
+    pub detail_badge_cached: &'static str,
     pub detail_stale: &'static str,
     /// Short weekday names, Sunday first (SYSTEMTIME::wDayOfWeek order).
     pub weekdays: [&'static str; 7],

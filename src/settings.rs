@@ -31,8 +31,6 @@ pub(crate) struct SettingsFile {
     pub widget_visible: bool,
     #[serde(default)]
     pub floating_visible: bool,
-    #[serde(default)]
-    pub floating_locked: bool,
     #[serde(default = "default_detailed_tray_icons")]
     pub detailed_tray_icons: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,7 +61,6 @@ impl Default for SettingsFile {
             last_update_check_unix: None,
             widget_visible: true,
             floating_visible: false,
-            floating_locked: false,
             detailed_tray_icons: true,
             floating_x: None,
             floating_y: None,
@@ -301,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn older_settings_default_floating_monitor_to_hidden_and_unlocked() {
+    fn older_settings_default_floating_monitor_to_hidden() {
         let settings: SettingsFile = serde_json::from_str(
             r#"{
                 "widget_visible": true,
@@ -312,7 +309,6 @@ mod tests {
         .expect("older settings should remain readable");
 
         assert!(!settings.floating_visible);
-        assert!(!settings.floating_locked);
         assert!(settings.detailed_tray_icons);
         assert_eq!(settings.floating_x, None);
         assert_eq!(settings.floating_y, None);

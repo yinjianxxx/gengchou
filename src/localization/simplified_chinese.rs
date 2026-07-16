@@ -34,7 +34,6 @@ pub(super) const STRINGS: Strings = Strings {
     exit: "退出",
     show_widget: "小组件",
     show_floating_monitor: "浮窗",
-    lock_floating_position: "锁定浮窗位置",
     detailed_tray_icons: "图标",
     notifications: "通知",
     notify_session_reset: "短期额度重置时通知",
@@ -71,6 +70,10 @@ pub(super) const STRINGS: Strings = Strings {
     detail_badge_rate_limited: "已限流",
     detail_badge_error: "请求失败",
     detail_badge_loading: "加载中",
+    detail_badge_near_limit: "接近上限",
+    detail_badge_normal: "正常",
+    detail_badge_unused: "未使用",
+    detail_badge_cached: "上次数据",
     detail_stale: "数据来自上次运行",
     weekdays: ["周日", "周一", "周二", "周三", "周四", "周五", "周六"],
 };

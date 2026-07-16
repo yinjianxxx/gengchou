@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
@@ -27,6 +28,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::compact_layout::{self, BadgeHit, ColorKey, DrawCmd, FontKey, Metrics, Scene, TileSize};
+use crate::compact_view::{self, CompactViewModel};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::{
@@ -62,9 +65,7 @@ impl SendHwnd {
 /// Shared application state
 #[derive(Clone, Debug, Default)]
 struct WidgetUsageWindow {
-    label: String,
     percent: Option<f64>,
-    text: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +88,7 @@ struct AppState {
     claude_widget: ProviderWidgetData,
     codex_widget: ProviderWidgetData,
     antigravity_widget: ProviderWidgetData,
+    compact_vm: CompactViewModel,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
@@ -118,10 +120,10 @@ struct AppState {
     details_hwnd: Option<HWND>,
     floating_hwnd: Option<HWND>,
     floating_visible: bool,
-    floating_locked: bool,
     detailed_tray_icons: bool,
     floating_x: Option<i32>,
     floating_y: Option<i32>,
+    widget_tooltip_hwnd: Option<SendHwnd>,
 
     taskbar_index: usize,
     tray_offset: i32,
@@ -159,7 +161,6 @@ const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
 const IDM_TOGGLE_FLOATING: u16 = 32;
-const IDM_LOCK_FLOATING: u16 = 33;
 const IDM_RESET_FLOATING_POSITION: u16 = 34;
 const IDM_DETAILED_TRAY_ICONS: u16 = 35;
 const IDM_LANG_SYSTEM: u16 = 40;
@@ -181,9 +182,14 @@ const IDM_NOTIFY_SESSION_RESET: u16 = 80;
 const IDM_NOTIFY_WEEKLY_RESET: u16 = 81;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
-/// WM_MOUSELEAVE (winuser.h); the windows crate gates it behind the
-/// Win32_UI_Controls feature, which we do not otherwise need.
+/// WM_MOUSELEAVE (winuser.h), kept local to avoid pulling a control-specific
+/// constant into the custom tooltip implementation.
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
+const WIDGET_TOOLTIP_DELAY_MS: u32 = 650;
+const WIDGET_TOOLTIP_MIN_WIDTH: i32 = 180;
+const WIDGET_TOOLTIP_MAX_WIDTH: i32 = 320;
+const WIDGET_TOOLTIP_EDGE_GAP: i32 = 7;
+const TIMER_WIDGET_TOOLTIP: usize = 14;
 /// Timer on the broadcast helper window that coalesces setting/display
 /// broadcast bursts into one refresh (trailing-edge debounce).
 const TIMER_BROADCAST_DEBOUNCE: usize = 10;
@@ -273,6 +279,7 @@ static SESSION_INACTIVE: AtomicBool = AtomicBool::new(false);
 struct PollCoordinator {
     in_flight: AtomicBool,
     pending: AtomicBool,
+    force_claude_refresh: AtomicBool,
     generation: AtomicU64,
 }
 
@@ -281,6 +288,7 @@ impl PollCoordinator {
         Self {
             in_flight: AtomicBool::new(false),
             pending: AtomicBool::new(false),
+            force_claude_refresh: AtomicBool::new(false),
             generation: AtomicU64::new(0),
         }
     }
@@ -288,7 +296,10 @@ impl PollCoordinator {
     /// Register a refresh request. The caller that changes `in_flight` from
     /// false to true owns starting the single worker; every other caller is
     /// collapsed into the worker's one pending follow-up pass.
-    fn request(&self) -> bool {
+    fn request(&self, force_claude_refresh: bool) -> bool {
+        if force_claude_refresh {
+            self.force_claude_refresh.store(true, Ordering::Release);
+        }
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.pending.store(true, Ordering::Release);
         self.in_flight
@@ -296,9 +307,12 @@ impl PollCoordinator {
             .is_ok()
     }
 
-    fn begin_pass(&self) -> u64 {
+    fn begin_pass(&self) -> (u64, bool) {
         self.pending.store(false, Ordering::Release);
-        self.generation.load(Ordering::Acquire)
+        (
+            self.generation.load(Ordering::Acquire),
+            self.force_claude_refresh.swap(false, Ordering::AcqRel),
+        )
     }
 
     fn is_current(&self, generation: u64) -> bool {
@@ -309,6 +323,7 @@ impl PollCoordinator {
     fn invalidate_pending(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.pending.store(false, Ordering::Release);
+        self.force_claude_refresh.store(false, Ordering::Release);
     }
 
     /// Return true when this worker should immediately perform the one
@@ -349,6 +364,7 @@ static UI_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 const WINDOW_CLASS_NAME: &str = "AIUsageMonitor";
 const DETAIL_WINDOW_CLASS_NAME: &str = "AIUsageMonitorDetails";
 const FLOATING_WINDOW_CLASS_NAME: &str = "AIUsageMonitorFloating";
+const WIDGET_TOOLTIP_WINDOW_CLASS_NAME: &str = "AIUsageMonitorWidgetTooltip";
 /// Hidden top-level helper window. Two jobs the embedded widget cannot do
 /// itself: receive broadcast messages (WM_SETTINGCHANGE / WM_DISPLAYCHANGE
 /// are only sent to top-level windows, and the widget is a WS_CHILD of the
@@ -356,16 +372,21 @@ const FLOATING_WINDOW_CLASS_NAME: &str = "AIUsageMonitorFloating";
 /// not reflected until the next poll), and be findable by class name so a
 /// second launched instance can ask us to show the detail popup.
 const BROADCAST_WINDOW_CLASS_NAME: &str = "AIUsageMonitorBroadcast";
-const DETAIL_POPUP_WIDTH: i32 = 420;
+const DETAIL_POPUP_WIDTH: i32 = 408;
 /// Title area above the first provider group.
-const DETAIL_HEADER_H: i32 = 50;
-/// Provider header row: accent dot + provider name + status badge.
-const DETAIL_GROUP_HEADER_H: i32 = 28;
+const DETAIL_HEADER_H: i32 = 52;
+/// Provider identity line: icon chip + name + compact state label.
+const DETAIL_GROUP_HEADER_H: i32 = 44;
 /// One quota window: label/bar/percent line plus the reset line below it.
-const DETAIL_WINDOW_ROW_H: i32 = 44;
+const DETAIL_WINDOW_ROW_H: i32 = 48;
+const DETAIL_PRIMARY_LINE_H: i32 = 18;
 const DETAIL_GROUP_GAP: i32 = 10;
-const DETAIL_CONTENT_BOTTOM_PAD: i32 = 8;
-const DETAIL_FOOTER_H: i32 = 46;
+const DETAIL_CARD_MARGIN: i32 = 18;
+const DETAIL_GROUP_PAD_V: i32 = 6;
+const DETAIL_LOGO_CHIP_SIZE: i32 = 28;
+const DETAIL_BAR_GAP: i32 = 3;
+const DETAIL_CONTENT_BOTTOM_PAD: i32 = 12;
+const DETAIL_FOOTER_H: i32 = 42;
 /// Content height when no provider rows exist yet (waiting message).
 const DETAIL_EMPTY_H: i32 = 40;
 /// A popup dismissed this recently is treated as "the user clicked the tray
@@ -373,11 +394,11 @@ const DETAIL_EMPTY_H: i32 = 40;
 /// open request, and re-opening would make the popup flicker instead of
 /// toggling.
 const DETAIL_REOPEN_SUPPRESS_MS: u128 = 300;
-const FLOATING_MARGIN: i32 = 16;
+// Keep enough room for the DWM shadow without making the surface look detached
+// from the display edge. This is scaled with the monitor DPI.
+const FLOATING_MARGIN: i32 = 8;
 const FLOATING_DRAG_THRESHOLD: i32 = 3;
-const FLOATING_CONTENT_LEFT_MARGIN: i32 = 6;
-const FLOATING_TEXT_RIGHT_PADDING: i32 = 6;
-const FLOATING_MIN_TEXT_WIDTH: i32 = 24;
+const FLOATING_CONTENT_LEFT_MARGIN: i32 = 8;
 static FLOATING_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static FLOATING_MOVING: AtomicBool = AtomicBool::new(false);
 
@@ -426,6 +447,10 @@ fn scale_px_for_dpi(px: i32, dpi: u32) -> i32 {
 /// Scale a base pixel value (designed at 96 DPI) for the active HWND.
 fn sc(px: i32) -> i32 {
     ACTIVE_WINDOW_DPI.with(|dpi| scale_px_for_dpi(px, dpi.get()))
+}
+
+fn active_window_dpi() -> u32 {
+    ACTIVE_WINDOW_DPI.with(|dpi| normalize_dpi(dpi.get()))
 }
 
 struct DpiScope {
@@ -919,10 +944,23 @@ struct DetailPopupState {
 struct DetailProviderGroup {
     kind: tray_icon::TrayIconKind,
     name: String,
-    /// Short status shown right-aligned on the provider header line;
-    /// the bool selects the warn colour (auth problems) over muted.
-    badge: Option<(String, bool)>,
+    /// Compact status shown on the provider header. Tone carries product
+    /// meaning independently from the localized copy.
+    badge: Option<DetailBadge>,
     rows: Vec<DetailUsageRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailBadgeTone {
+    Neutral,
+    Degraded,
+    Critical,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DetailBadge {
+    text: String,
+    tone: DetailBadgeTone,
 }
 
 #[derive(Clone)]
@@ -950,8 +988,43 @@ const DETAIL_HOVER_MOVE: u8 = 3;
 const DETAIL_DEFAULT_MOVEMENT_UNLOCKED: bool = true;
 static DETAIL_MOVEMENT_UNLOCKED: AtomicBool = AtomicBool::new(DETAIL_DEFAULT_MOVEMENT_UNLOCKED);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WidgetTooltipRow {
+    window_label: String,
+    percent_text: String,
+    reset_text: String,
+    warn: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WidgetTooltipSnapshot {
+    kind: tray_icon::TrayIconKind,
+    provider_name: String,
+    rows: Vec<WidgetTooltipRow>,
+}
+
+#[derive(Default)]
+struct WidgetTooltipRuntime {
+    hover_kind: Option<tray_icon::TrayIconKind>,
+    hits: Vec<BadgeHit>,
+    snapshot: Option<WidgetTooltipSnapshot>,
+}
+
+static WIDGET_TOOLTIP_RUNTIME: Mutex<WidgetTooltipRuntime> = Mutex::new(WidgetTooltipRuntime {
+    hover_kind: None,
+    hits: Vec::new(),
+    snapshot: None,
+});
+static WIDGET_TOOLTIP_CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
 fn lock_detail_state() -> MutexGuard<'static, Option<DetailPopupState>> {
     DETAIL_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_widget_tooltip_runtime() -> MutexGuard<'static, WidgetTooltipRuntime> {
+    WIDGET_TOOLTIP_RUNTIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 const USAGE_CACHE_MAX_AGE_SECS: u64 = 48 * 60 * 60;
@@ -1169,7 +1242,6 @@ fn save_state_settings() {
             last_update_check_unix: s.last_update_check_unix,
             widget_visible: s.widget_visible,
             floating_visible: s.floating_visible,
-            floating_locked: s.floating_locked,
             detailed_tray_icons: s.detailed_tray_icons,
             floating_x: s.floating_x,
             floating_y: s.floating_y,
@@ -1233,26 +1305,115 @@ fn tray_tooltip_from_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Stri
     result
 }
 
-fn provider_tooltip(provider_name: &str, usage: Option<&UsageData>, strings: Strings) -> String {
+fn provider_tooltip_lines<'a>(
+    provider_name: &str,
+    windows: impl IntoIterator<Item = &'a UsageWindow>,
+    strings: Strings,
+) -> Vec<String> {
     let mut lines = vec![provider_name.to_string()];
-    if let Some(usage) = usage.filter(|usage| !usage.is_empty()) {
-        for window in selected_usage_windows(usage) {
-            let mut line = format!(
-                "{}: {:.0}%",
-                usage_window_label(window, strings),
-                window.percentage.clamp(0.0, 100.0)
-            );
-            if let Some(resets_at) = window.resets_at {
-                line.push_str(" (");
-                line.push_str(&detail_reset_line(resets_at, strings));
-                line.push(')');
-            }
-            lines.push(line);
+    for window in windows {
+        let mut line = format!(
+            "{}: {:.0}%",
+            usage_window_label(window, strings),
+            window.percentage.clamp(0.0, 100.0)
+        );
+        if let Some(resets_at) = window.resets_at {
+            line.push_str(" (");
+            line.push_str(&detail_reset_line(resets_at, strings, false));
+            line.push(')');
         }
-    } else {
+        lines.push(line);
+    }
+    if lines.len() == 1 {
         lines.push("--".to_string());
     }
+    lines
+}
+
+fn provider_tooltip(provider_name: &str, usage: Option<&UsageData>, strings: Strings) -> String {
+    let windows = usage
+        .filter(|usage| !usage.is_empty())
+        .map(compact_view::selected_usage_windows)
+        .unwrap_or_default();
+    let lines = provider_tooltip_lines(provider_name, windows, strings);
     tray_tooltip_from_lines(lines.iter().map(String::as_str))
+}
+
+fn widget_tooltip_reset_text(resets_at: SystemTime, strings: Strings) -> String {
+    match resets_at.duration_since(SystemTime::now()) {
+        Ok(duration) if duration.as_secs() > 0 => strings
+            .detail_resets_in
+            .replace("{duration}", &detail_duration_text(duration, strings)),
+        _ => strings.detail_resets_now.to_string(),
+    }
+}
+
+fn widget_tooltip_snapshot(kind: tray_icon::TrayIconKind) -> WidgetTooltipSnapshot {
+    let state = lock_state();
+    let Some(s) = state.as_ref() else {
+        return WidgetTooltipSnapshot {
+            kind,
+            provider_name: String::new(),
+            rows: Vec::new(),
+        };
+    };
+    let strings = s.language.strings();
+    let provider_has_values = s
+        .compact_vm
+        .providers
+        .iter()
+        .any(|provider| provider.kind == kind && !provider.windows.is_empty());
+    let (provider_name, usage) = match kind {
+        tray_icon::TrayIconKind::Claude => (
+            strings.claude_code_model,
+            provider_has_values
+                .then(|| s.data.as_ref().and_then(|data| data.claude_code.as_ref()))
+                .flatten(),
+        ),
+        tray_icon::TrayIconKind::Codex => (
+            strings.codex_model,
+            provider_has_values
+                .then(|| s.data.as_ref().and_then(|data| data.codex.as_ref()))
+                .flatten(),
+        ),
+        tray_icon::TrayIconKind::Antigravity => (
+            strings.antigravity_model,
+            provider_has_values
+                .then(|| s.data.as_ref().and_then(|data| data.antigravity.as_ref()))
+                .flatten(),
+        ),
+    };
+    let mut rows = usage
+        .filter(|usage| !usage.is_empty())
+        .into_iter()
+        .flat_map(|usage| usage.windows.iter())
+        .map(|window| {
+            let display_percent = compact_view::display_percent(window.percentage);
+            WidgetTooltipRow {
+                window_label: usage_window_label(window, strings),
+                percent_text: format!("{display_percent}%"),
+                reset_text: window
+                    .resets_at
+                    .map(|resets_at| widget_tooltip_reset_text(resets_at, strings))
+                    .unwrap_or_else(|| strings.detail_reset_unavailable.to_string()),
+                warn: display_percent >= compact_view::WARN_THRESHOLD_PERCENT,
+            }
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        rows.push(WidgetTooltipRow {
+            window_label: "--".to_string(),
+            percent_text: String::new(),
+            reset_text: strings.detail_waiting.to_string(),
+            warn: false,
+        });
+    }
+
+    WidgetTooltipSnapshot {
+        kind,
+        provider_name: provider_name.to_string(),
+        rows,
+    }
 }
 
 fn app_tooltip_provider_line(
@@ -1263,7 +1424,7 @@ fn app_tooltip_provider_line(
     let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
         return format!("{provider_name}: --");
     };
-    let windows = selected_usage_windows(usage)
+    let windows = compact_view::selected_usage_windows(usage)
         .into_iter()
         .map(|window| {
             format!(
@@ -1774,38 +1935,6 @@ fn usage_window_label(window: &UsageWindow, strings: Strings) -> String {
         .unwrap_or_else(|| strings.quota_window.to_string())
 }
 
-/// Compact surfaces intentionally use one language-independent duration
-/// vocabulary. This keeps their narrow columns stable when the UI language
-/// changes; the detail popup continues to use `usage_window_label` above.
-fn compact_usage_window_label(window: &UsageWindow, strings: Strings) -> String {
-    if let Some(seconds) = window.duration_seconds.filter(|seconds| *seconds > 0) {
-        if approximately(seconds, 5 * 60 * 60) {
-            return "5h".to_string();
-        }
-        if approximately(seconds, 7 * 24 * 60 * 60) {
-            return "7d".to_string();
-        }
-        if seconds % (24 * 60 * 60) == 0 {
-            return format!("{}d", seconds / (24 * 60 * 60));
-        }
-        if seconds % (60 * 60) == 0 {
-            return format!("{}h", seconds / (60 * 60));
-        }
-        if seconds % 60 == 0 {
-            return format!("{}m", seconds / 60);
-        }
-        return format!("{seconds}s");
-    }
-
-    window
-        .source_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .map(|label| label.chars().take(8).collect())
-        .unwrap_or_else(|| strings.quota_window.to_string())
-}
-
 fn usage_window_dividers(window: &UsageWindow) -> i32 {
     let Some(seconds) = window.duration_seconds else {
         return 1;
@@ -1820,60 +1949,42 @@ fn usage_window_dividers(window: &UsageWindow) -> i32 {
     units.clamp(1, 10) as i32
 }
 
-fn placeholder_widget(text: &str) -> ProviderWidgetData {
+fn placeholder_widget() -> ProviderWidgetData {
     ProviderWidgetData {
-        windows: vec![WidgetUsageWindow {
-            label: String::new(),
-            percent: None,
-            text: text.to_string(),
-        }],
+        windows: vec![WidgetUsageWindow { percent: None }],
     }
 }
 
-fn provider_widget_from_usage(
-    usage: Option<&UsageData>,
-    strings: Strings,
-    hide_labels: bool,
-) -> ProviderWidgetData {
+fn provider_widget_from_usage(usage: Option<&UsageData>) -> ProviderWidgetData {
     let Some(usage) = usage.filter(|usage| !usage.is_empty()) else {
-        return placeholder_widget("--");
+        return placeholder_widget();
     };
 
     ProviderWidgetData {
-        windows: selected_usage_windows(usage)
+        windows: compact_view::selected_usage_windows(usage)
             .into_iter()
             .map(|window| WidgetUsageWindow {
-                label: if hide_labels {
-                    String::new()
-                } else {
-                    compact_usage_window_label(window, strings)
-                },
                 percent: Some(window.percentage.clamp(0.0, 100.0)),
-                text: poller::format_line(window),
             })
             .collect(),
     }
 }
 
-fn selected_usage_windows(usage: &UsageData) -> Vec<&UsageWindow> {
-    let mut selected: Vec<&UsageWindow> = usage.windows.iter().collect();
-    if selected.len() > 2 {
-        selected.sort_by(|left, right| {
-            right
-                .percentage
-                .partial_cmp(&left.percentage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        selected.truncate(2);
-        selected.sort_by_key(|window| window.duration_seconds.unwrap_or(u64::MAX));
-    }
-    selected
-}
-
 fn set_widget_placeholders(state: &mut AppState, text: &str) {
-    state.claude_widget = placeholder_widget(text);
-    state.codex_widget = placeholder_widget(text);
-    state.antigravity_widget = placeholder_widget(text);
+    state.claude_widget = placeholder_widget();
+    state.codex_widget = placeholder_widget();
+    state.antigravity_widget = placeholder_widget();
+    let compact_text = if text == "!" { "--" } else { text };
+    state.compact_vm = compact_view::placeholder_model(
+        compact_text,
+        &state.provider_order,
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
+    );
+    if text == "!" {
+        mark_all_compact_providers_error(&mut state.compact_vm);
+    }
 }
 
 fn refresh_usage_texts(state: &mut AppState) {
@@ -1883,18 +1994,28 @@ fn refresh_usage_texts(state: &mut AppState) {
 
     let strings = state.language.strings();
     let data = state.data.as_ref();
-    state.claude_widget = provider_widget_from_usage(
-        data.and_then(|data| data.claude_code.as_ref()),
+    state.claude_widget =
+        provider_widget_from_usage(data.and_then(|data| data.claude_code.as_ref()));
+    state.codex_widget = provider_widget_from_usage(data.and_then(|data| data.codex.as_ref()));
+    state.antigravity_widget =
+        provider_widget_from_usage(data.and_then(|data| data.antigravity.as_ref()));
+    state.compact_vm = compact_view::build(
+        data,
         strings,
-        false,
+        &state.provider_order,
+        state.show_claude_code,
+        state.show_codex,
+        state.show_antigravity,
     );
-    state.codex_widget =
-        provider_widget_from_usage(data.and_then(|data| data.codex.as_ref()), strings, true);
-    state.antigravity_widget = provider_widget_from_usage(
-        data.and_then(|data| data.antigravity.as_ref()),
-        strings,
-        true,
-    );
+    if state.last_error.is_some() {
+        mark_all_compact_providers_error(&mut state.compact_vm);
+    }
+}
+
+fn mark_all_compact_providers_error(vm: &mut CompactViewModel) {
+    for provider in &mut vm.providers {
+        provider.attention = compact_view::Attention::Error;
+    }
 }
 
 fn merge_missing_provider_data(
@@ -2183,7 +2304,7 @@ fn trigger_manual_refresh(_hwnd: HWND) {
     }
     render_layered();
     refresh_floating_monitor(false);
-    request_poll();
+    request_poll_with(true);
 }
 
 fn show_usage_details(_tray_hwnd: HWND) {
@@ -2367,6 +2488,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
                 .as_ref()
                 .and_then(|data| data.claude_code_error)
                 .or(global_error),
+            s.data_is_cached,
             strings,
         ));
     }
@@ -2379,6 +2501,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
                 .as_ref()
                 .and_then(|data| data.codex_error)
                 .or(global_error),
+            s.data_is_cached,
             strings,
         ));
     }
@@ -2391,6 +2514,7 @@ fn detail_popup_snapshot() -> DetailPopupState {
                 .as_ref()
                 .and_then(|data| data.antigravity_error)
                 .or(global_error),
+            s.data_is_cached,
             strings,
         ));
     }
@@ -2408,19 +2532,26 @@ fn detail_provider_group(
     name: &str,
     usage: Option<&UsageData>,
     error: Option<ProviderStatus>,
+    data_is_cached: bool,
     strings: Strings,
 ) -> DetailProviderGroup {
     let badge = match error {
-        Some(ProviderStatus::AuthRequired) => {
-            Some((strings.detail_auth_required.to_string(), true))
-        }
-        Some(ProviderStatus::RateLimited) => {
-            Some((strings.detail_badge_rate_limited.to_string(), false))
-        }
-        Some(ProviderStatus::RequestFailed) => {
-            Some((strings.detail_badge_error.to_string(), false))
-        }
-        None if usage.is_none() => Some((strings.detail_badge_loading.to_string(), false)),
+        Some(ProviderStatus::AuthRequired) => Some(DetailBadge {
+            text: strings.detail_auth_required.to_string(),
+            tone: DetailBadgeTone::Critical,
+        }),
+        Some(ProviderStatus::RateLimited) => Some(DetailBadge {
+            text: strings.detail_badge_rate_limited.to_string(),
+            tone: DetailBadgeTone::Degraded,
+        }),
+        Some(ProviderStatus::RequestFailed) => Some(DetailBadge {
+            text: strings.detail_badge_error.to_string(),
+            tone: DetailBadgeTone::Degraded,
+        }),
+        None if usage.is_none_or(UsageData::is_empty) => Some(DetailBadge {
+            text: strings.detail_badge_loading.to_string(),
+            tone: DetailBadgeTone::Neutral,
+        }),
         None => None,
     };
 
@@ -2430,7 +2561,7 @@ fn detail_provider_group(
             .iter()
             .map(|window| {
                 detail_usage_row(
-                    usage_window_label(window, strings),
+                    compact_view::compact_usage_window_label(window, strings),
                     Some(window),
                     error,
                     usage_window_dividers(window),
@@ -2438,14 +2569,32 @@ fn detail_provider_group(
                 )
             })
             .collect(),
-        None => vec![detail_usage_row(
-            strings.quota_window.to_string(),
-            None,
-            error,
-            1,
-            strings,
-        )],
+        None => vec![detail_usage_row("--".to_string(), None, error, 1, strings)],
     };
+
+    let badge = badge.or_else(|| {
+        if data_is_cached {
+            Some(DetailBadge {
+                text: strings.detail_badge_cached.to_string(),
+                tone: DetailBadgeTone::Neutral,
+            })
+        } else if rows.iter().any(|row| row.warn) {
+            Some(DetailBadge {
+                text: strings.detail_badge_near_limit.to_string(),
+                tone: DetailBadgeTone::Critical,
+            })
+        } else if rows.iter().all(|row| row.percent == Some(0.0)) {
+            Some(DetailBadge {
+                text: strings.detail_badge_unused.to_string(),
+                tone: DetailBadgeTone::Neutral,
+            })
+        } else {
+            Some(DetailBadge {
+                text: strings.detail_badge_normal.to_string(),
+                tone: DetailBadgeTone::Neutral,
+            })
+        }
+    });
 
     DetailProviderGroup {
         kind,
@@ -2470,7 +2619,7 @@ fn detail_usage_row(
             None => strings.detail_waiting.to_string(),
             Some(section) => match section.resets_at {
                 None => strings.detail_reset_unavailable.to_string(),
-                Some(resets_at) => detail_reset_line(resets_at, strings),
+                Some(resets_at) => detail_reset_line(resets_at, strings, true),
             },
         }
     };
@@ -2480,22 +2629,35 @@ fn detail_usage_row(
         percent,
         reset_text,
         dividers,
-        warn: percent.unwrap_or(0.0) >= 90.0,
+        warn: percent.is_some_and(|percent| {
+            compact_view::display_percent(percent) >= compact_view::WARN_THRESHOLD_PERCENT
+        }),
     }
+}
+
+fn detail_percent_is_display_zero(percent: Option<f64>) -> bool {
+    percent.is_some_and(|percent| compact_view::display_percent(percent) == 0)
 }
 
 /// "Resets in 2h 13m (21:30)" - relative countdown plus the absolute local
 /// time, which is what people actually plan around for longer quota windows.
-fn detail_reset_line(resets_at: SystemTime, strings: Strings) -> String {
+/// `compact` selects the popup's tightened "… · HH:MM" form; the tray tooltip
+/// passes false to keep its parenthesised "… (HH:MM)" wrapping.
+fn detail_reset_line(resets_at: SystemTime, strings: Strings, compact: bool) -> String {
     match resets_at.duration_since(SystemTime::now()) {
         Ok(duration) if duration.as_secs() > 0 => {
             let mut text = strings
                 .detail_resets_in
                 .replace("{duration}", &detail_duration_text(duration, strings));
             if let Some(at) = format_local_time(resets_at, strings) {
-                text.push_str(" (");
-                text.push_str(&at);
-                text.push(')');
+                if compact {
+                    text.push_str(" · ");
+                    text.push_str(&at);
+                } else {
+                    text.push_str(" (");
+                    text.push_str(&at);
+                    text.push(')');
+                }
             }
             text
         }
@@ -2576,15 +2738,13 @@ fn detail_poll_timing_status(
     let mut status = if data_is_cached {
         format!("{} · {updated}", strings.detail_stale)
     } else {
-        updated
+        strings.detail_poll_every.replace(
+            "{interval}",
+            &detail_duration_from_secs((poll_interval_ms / 1000) as u64, strings),
+        )
     };
 
     let interval_secs = (poll_interval_ms / 1000) as u64;
-    status.push_str(" · ");
-    status.push_str(&strings.detail_poll_every.replace(
-        "{interval}",
-        &detail_duration_from_secs(interval_secs, strings),
-    ));
     if !data_is_cached && interval_secs > elapsed {
         status.push_str(" · ");
         status.push_str(&strings.detail_next_in.replace(
@@ -2608,12 +2768,24 @@ fn detail_duration_from_secs(total_secs: u64, strings: Strings) -> String {
     let days = total_minutes / (24 * 60);
     let hours = (total_minutes % (24 * 60)) / 60;
     let minutes = total_minutes % 60;
+    let joiner = if [
+        strings.day_suffix,
+        strings.hour_suffix,
+        strings.minute_suffix,
+    ]
+    .iter()
+    .any(|suffix| suffix.chars().any(is_east_asian_character))
+    {
+        ""
+    } else {
+        " "
+    };
 
     if days > 0 {
         if hours > 0 {
             format!(
-                "{}{} {}{}",
-                days, strings.day_suffix, hours, strings.hour_suffix
+                "{}{}{joiner}{}{}",
+                days, strings.day_suffix, hours, strings.hour_suffix,
             )
         } else {
             format!("{}{}", days, strings.day_suffix)
@@ -2621,8 +2793,8 @@ fn detail_duration_from_secs(total_secs: u64, strings: Strings) -> String {
     } else if hours > 0 {
         if minutes > 0 {
             format!(
-                "{}{} {}{}",
-                hours, strings.hour_suffix, minutes, strings.minute_suffix
+                "{}{}{joiner}{}{}",
+                hours, strings.hour_suffix, minutes, strings.minute_suffix,
             )
         } else {
             format!("{}{}", hours, strings.hour_suffix)
@@ -2691,7 +2863,7 @@ fn refresh_detail_popup_if_open() {
 }
 
 fn detail_group_height(group: &DetailProviderGroup) -> i32 {
-    DETAIL_GROUP_HEADER_H + group.rows.len() as i32 * DETAIL_WINDOW_ROW_H
+    2 * DETAIL_GROUP_PAD_V + DETAIL_GROUP_HEADER_H + group.rows.len() as i32 * DETAIL_WINDOW_ROW_H
 }
 
 fn detail_popup_size(snapshot: &DetailPopupState) -> (i32, i32) {
@@ -2705,6 +2877,514 @@ fn detail_popup_size(snapshot: &DetailPopupState) -> (i32, i32) {
         sc(DETAIL_POPUP_WIDTH),
         sc(DETAIL_HEADER_H + content_h + DETAIL_CONTENT_BOTTOM_PAD + DETAIL_FOOTER_H),
     )
+}
+
+/// Diagnostic: render the taskbar badge strip and floating numeric monitor at
+/// 125% DPI with representative values. The output deliberately uses the
+/// production scene and GDI executor, so layout previews exercise the same
+/// fonts, provider tiles, colors, and clipping as the live Debug windows.
+pub fn dump_widget(dir: &str) -> i32 {
+    let _dpi = DpiScope::new(120);
+    let window = |label: &str, percent: f64, countdown: &str, severity: compact_view::Severity| {
+        compact_view::WindowView {
+            label: label.to_string(),
+            percent: Some(percent),
+            display_percent: compact_view::display_percent(percent),
+            percent_text: format!("{}%", compact_view::display_percent(percent)),
+            countdown: countdown.to_string(),
+            duration_seconds: None,
+            severity,
+        }
+    };
+    let provider = |kind, windows, attention| compact_view::ProviderView {
+        kind,
+        badge: None,
+        windows,
+        placeholder: None,
+        attention,
+    };
+    let warn_vm = CompactViewModel {
+        providers: vec![
+            provider(
+                tray_icon::TrayIconKind::Claude,
+                vec![
+                    window("5h", 64.0, "\u{00b7}3h", compact_view::Severity::Normal),
+                    window("7d", 92.0, "\u{00b7}4d", compact_view::Severity::Warn),
+                ],
+                compact_view::Attention::Warn,
+            ),
+            provider(
+                tray_icon::TrayIconKind::Codex,
+                vec![window(
+                    "7d",
+                    51.0,
+                    "\u{00b7}6d",
+                    compact_view::Severity::Normal,
+                )],
+                compact_view::Attention::Normal,
+            ),
+            provider(
+                tray_icon::TrayIconKind::Antigravity,
+                vec![
+                    window("5h", 0.0, "", compact_view::Severity::Normal),
+                    window("7d", 1.0, "\u{00b7}2d", compact_view::Severity::Normal),
+                ],
+                compact_view::Attention::Normal,
+            ),
+        ],
+    };
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        diagnose::log_error("dump compact surfaces: create directory failed", error);
+        return 1;
+    }
+
+    let mut normal_vm = warn_vm.clone();
+    for provider in &mut normal_vm.providers {
+        provider.attention = compact_view::Attention::Normal;
+        for window in &mut provider.windows {
+            window.severity = compact_view::Severity::Normal;
+            if window.display_percent >= compact_view::WARN_THRESHOLD_PERCENT {
+                window.percent = Some(82.0);
+                window.display_percent = 82;
+                window.percent_text = "82%".to_string();
+            }
+        }
+    }
+    // Regression fixture for mixed-width percentages inside one provider. The
+    // text stays right-aligned, while each gauge must begin under the displayed
+    // value instead of under the widest value in the group.
+    let alignment_vm = CompactViewModel {
+        providers: vec![
+            provider(
+                tray_icon::TrayIconKind::Claude,
+                vec![
+                    window("5h", 0.0, "", compact_view::Severity::Normal),
+                    window("7d", 29.0, "\u{00b7}5d", compact_view::Severity::Normal),
+                ],
+                compact_view::Attention::Normal,
+            ),
+            provider(
+                tray_icon::TrayIconKind::Codex,
+                vec![window(
+                    "7d",
+                    27.0,
+                    "\u{00b7}6d",
+                    compact_view::Severity::Normal,
+                )],
+                compact_view::Attention::Normal,
+            ),
+            provider(
+                tray_icon::TrayIconKind::Antigravity,
+                vec![
+                    window("5h", 0.0, "", compact_view::Severity::Normal),
+                    window("7d", 1.0, "\u{00b7}1d", compact_view::Severity::Normal),
+                ],
+                compact_view::Attention::Normal,
+            ),
+        ],
+    };
+    let nodata_vm = CompactViewModel {
+        providers: [
+            tray_icon::TrayIconKind::Claude,
+            tray_icon::TrayIconKind::Codex,
+            tray_icon::TrayIconKind::Antigravity,
+        ]
+        .into_iter()
+        .map(|kind| compact_view::ProviderView {
+            kind,
+            badge: None,
+            windows: Vec::new(),
+            placeholder: Some("--".to_string()),
+            attention: compact_view::Attention::Normal,
+        })
+        .collect(),
+    };
+    let mut error_vm = normal_vm.clone();
+    if let Some(provider) = error_vm
+        .providers
+        .iter_mut()
+        .find(|provider| provider.kind == tray_icon::TrayIconKind::Codex)
+    {
+        provider.attention = compact_view::Attention::Error;
+    }
+
+    let mut failed = false;
+    for (state_name, vm) in [
+        ("normal", &normal_vm),
+        ("warn", &warn_vm),
+        ("nodata", &nodata_vm),
+        ("error", &error_vm),
+    ] {
+        for (theme_name, is_dark) in [("dark", true), ("light", false)] {
+            for (surface_name, floating) in [("badges", false), ("rows", true)] {
+                let name = format!("{surface_name}-{state_name}-{theme_name}.bmp");
+                if dump_compact_surface_bmp(dir, &name, vm, floating, is_dark, false).is_err() {
+                    failed = true;
+                }
+            }
+        }
+    }
+    for (state_name, vm) in [("warn", &warn_vm), ("error", &error_vm)] {
+        for (surface_name, floating) in [("badges", false), ("rows", true)] {
+            let name = format!("{surface_name}-{state_name}-hc-dark.bmp");
+            if dump_compact_surface_bmp(dir, &name, vm, floating, true, true).is_err() {
+                failed = true;
+            }
+        }
+    }
+    for (theme_name, is_dark) in [("dark", true), ("light", false)] {
+        let name = format!("rows-alignment-{theme_name}.bmp");
+        if dump_compact_surface_bmp(dir, &name, &alignment_vm, true, is_dark, false).is_err() {
+            failed = true;
+        }
+    }
+    let tooltip_snapshots = [
+        WidgetTooltipSnapshot {
+            kind: tray_icon::TrayIconKind::Claude,
+            provider_name: "Claude Code".to_string(),
+            rows: vec![
+                WidgetTooltipRow {
+                    window_label: "5h".to_string(),
+                    percent_text: "63%".to_string(),
+                    reset_text: "3小时5分钟后重置".to_string(),
+                    warn: false,
+                },
+                WidgetTooltipRow {
+                    window_label: "7d".to_string(),
+                    percent_text: "92%".to_string(),
+                    reset_text: "6天11小时后重置".to_string(),
+                    warn: true,
+                },
+            ],
+        },
+        WidgetTooltipSnapshot {
+            kind: tray_icon::TrayIconKind::Codex,
+            provider_name: "Codex".to_string(),
+            rows: vec![WidgetTooltipRow {
+                window_label: "7d".to_string(),
+                percent_text: "31%".to_string(),
+                reset_text: "6天11小时后重置".to_string(),
+                warn: false,
+            }],
+        },
+    ];
+    for snapshot in &tooltip_snapshots {
+        let provider = match snapshot.kind {
+            tray_icon::TrayIconKind::Claude => "claude",
+            tray_icon::TrayIconKind::Codex => "codex",
+            tray_icon::TrayIconKind::Antigravity => "antigravity",
+        };
+        for (theme_name, is_dark) in [("dark", true), ("light", false)] {
+            let name = format!("tooltip-{provider}-{theme_name}.bmp");
+            if dump_widget_tooltip_bmp(dir, &name, snapshot, is_dark, false).is_err() {
+                failed = true;
+            }
+        }
+    }
+    if dump_widget_tooltip_bmp(
+        dir,
+        "tooltip-claude-hc-dark.bmp",
+        &tooltip_snapshots[0],
+        true,
+        true,
+    )
+    .is_err()
+    {
+        failed = true;
+    }
+    i32::from(failed)
+}
+
+fn dump_compact_surface_bmp(
+    dir: &str,
+    name: &str,
+    vm: &CompactViewModel,
+    floating: bool,
+    is_dark: bool,
+    high_contrast: bool,
+) -> Result<(), String> {
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.0.is_null() {
+            return Err("GetDC failed".to_string());
+        }
+        let scene = compact_scene(screen_dc, vm, high_contrast, floating);
+        let width = if floating {
+            sc(FLOATING_CONTENT_LEFT_MARGIN) + scene.width
+        } else {
+            sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + scene.width
+        };
+        let height = scene.height;
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return Err("CreateDIBSection failed".to_string());
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+        paint_compact_surface(
+            mem_dc,
+            width,
+            height,
+            &scene,
+            floating,
+            is_dark,
+            high_contrast,
+        );
+        let _ = GdiFlush();
+
+        let byte_count = (width * height * 4) as usize;
+        let mut pixels = std::slice::from_raw_parts(bits as *const u8, byte_count).to_vec();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        let mut file = Vec::with_capacity(54 + byte_count);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&(54 + byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&width.to_le_bytes());
+        file.extend_from_slice(&(-height).to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&(byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&pixels);
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND::default(), screen_dc);
+
+        let path = PathBuf::from(dir).join(name);
+        std::fs::write(&path, file).map_err(|error| error.to_string())?;
+        diagnose::log(format!("dumped compact surface to {}", path.display()));
+        Ok(())
+    }
+}
+
+fn dump_widget_tooltip_bmp(
+    dir: &str,
+    name: &str,
+    snapshot: &WidgetTooltipSnapshot,
+    is_dark: bool,
+    high_contrast: bool,
+) -> Result<(), String> {
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.0.is_null() {
+            return Err("GetDC failed".to_string());
+        }
+        let layout = widget_tooltip_layout(screen_dc, snapshot);
+        let width = layout.width;
+        let height = layout.height;
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return Err("CreateDIBSection failed".to_string());
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+        paint_widget_tooltip_content(mem_dc, width, height, snapshot, is_dark, high_contrast);
+        let _ = GdiFlush();
+
+        let byte_count = (width * height * 4) as usize;
+        let mut pixels = std::slice::from_raw_parts(bits as *const u8, byte_count).to_vec();
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 0xFF;
+        }
+        let mut file = Vec::with_capacity(54 + byte_count);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&(54 + byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&width.to_le_bytes());
+        file.extend_from_slice(&(-height).to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&(byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&pixels);
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND::default(), screen_dc);
+
+        let path = PathBuf::from(dir).join(name);
+        std::fs::write(&path, file).map_err(|error| error.to_string())?;
+        diagnose::log(format!("dumped widget tooltip to {}", path.display()));
+        Ok(())
+    }
+}
+
+/// Diagnostic: render the detail popup with representative data (matching the
+/// README screenshot's providers) to a BMP and exit. Mirrors
+/// `tray_icon::dump_icons`; lets popup layout changes be eyeballed without
+/// hunting for the live tray popup. Renders at 125%, matching the target
+/// desktop used for final visual review.
+pub fn dump_detail_popup(dir: &str) -> i32 {
+    ACTIVE_WINDOW_DPI.with(|dpi| dpi.set(120));
+
+    let row = |label: &str, percent: f64, reset: &str, dividers: i32| DetailUsageRow {
+        window_label: label.to_string(),
+        percent: Some(percent),
+        reset_text: reset.to_string(),
+        dividers,
+        warn: compact_view::display_percent(percent) >= compact_view::WARN_THRESHOLD_PERCENT,
+    };
+    let snapshot = DetailPopupState {
+        title: "AI Usage Monitor".to_string(),
+        providers: vec![
+            DetailProviderGroup {
+                kind: tray_icon::TrayIconKind::Claude,
+                name: "Claude Code".to_string(),
+                badge: Some(DetailBadge {
+                    text: "接近上限".to_string(),
+                    tone: DetailBadgeTone::Critical,
+                }),
+                rows: vec![
+                    row("5h", 8.0, "3小时5分钟后重置 · 01:00", 5),
+                    row("7d", 92.0, "5小时5分钟后重置 · 03:00", 7),
+                ],
+            },
+            DetailProviderGroup {
+                kind: tray_icon::TrayIconKind::Codex,
+                name: "Codex".to_string(),
+                badge: Some(DetailBadge {
+                    text: "正常".to_string(),
+                    tone: DetailBadgeTone::Neutral,
+                }),
+                rows: vec![row("7d", 51.0, "5天9小时后重置 · 07:00", 7)],
+            },
+            DetailProviderGroup {
+                kind: tray_icon::TrayIconKind::Antigravity,
+                name: "Antigravity".to_string(),
+                badge: Some(DetailBadge {
+                    text: "正常".to_string(),
+                    tone: DetailBadgeTone::Neutral,
+                }),
+                rows: vec![
+                    row("5h", 0.0, "5小时后重置 · 02:55", 5),
+                    row("7d", 1.0, "3天3小时后重置 · 01:51", 7),
+                ],
+            },
+        ],
+        status: "每 1分钟 · 44秒后刷新".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+
+    let (width, height) = detail_popup_size(&snapshot);
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let dib =
+            CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
+        if dib.is_invalid() || bits.is_null() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return 1;
+        }
+        let old_bmp = SelectObject(mem_dc, dib);
+        paint_detail_content(mem_dc, width, height, &snapshot);
+        let _ = windows::Win32::Graphics::Gdi::GdiFlush();
+
+        let byte_count = (width * height * 4) as usize;
+        let mut buf = std::slice::from_raw_parts(bits as *const u8, byte_count).to_vec();
+        // GDI fills/text leave the DIB alpha byte at 0; force opaque so a PNG
+        // conversion of this BMP does not come out fully transparent.
+        for px in buf.chunks_exact_mut(4) {
+            px[3] = 0xFF;
+        }
+
+        let mut file = Vec::with_capacity(54 + byte_count);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&(54 + byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&width.to_le_bytes());
+        file.extend_from_slice(&(-height).to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&(byte_count as u32).to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&2835u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&buf);
+
+        SelectObject(mem_dc, old_bmp);
+        let _ = DeleteObject(dib);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND::default(), screen_dc);
+
+        let path = format!("{dir}/detail-popup.bmp");
+        match std::fs::write(&path, file) {
+            Ok(_) => {
+                diagnose::log(format!("dumped detail popup to {path}"));
+                0
+            }
+            Err(error) => {
+                diagnose::log_error("dump detail popup: write failed", error);
+                1
+            }
+        }
+    }
 }
 
 unsafe fn detail_popup_position(width: i32, height: i32) -> (i32, i32) {
@@ -3059,69 +3739,48 @@ unsafe fn floating_target_position(
     }
 }
 
-fn trailing_floating_widget() -> Option<ProviderWidgetData> {
-    let state = lock_state();
-    let state = state.as_ref()?;
-    state
-        .provider_order
-        .iter()
-        .rev()
-        .find_map(|kind| match kind {
-            tray_icon::TrayIconKind::Claude if state.show_claude_code => {
-                Some(state.claude_widget.clone())
-            }
-            tray_icon::TrayIconKind::Codex if state.show_codex => Some(state.codex_widget.clone()),
-            tray_icon::TrayIconKind::Antigravity if state.show_antigravity => {
-                Some(state.antigravity_widget.clone())
-            }
-            _ => None,
-        })
-}
-
-fn measure_widget_text_width(hwnd: HWND, widget: &ProviderWidgetData) -> Option<i32> {
-    unsafe {
-        let hdc = GetDC(hwnd);
-        if hdc.0.is_null() {
-            return None;
-        }
-        let font = cached_font(sc(12), FW_MEDIUM.0 as i32);
-        let old_font = SelectObject(hdc, font);
-        let mut max_width = None;
-        for window in &widget.windows {
-            let wide = window.text.encode_utf16().collect::<Vec<_>>();
-            let mut size = SIZE::default();
-            if !wide.is_empty() && GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
-                max_width = Some(max_width.unwrap_or(0).max(size.cx));
-            }
-        }
-        SelectObject(hdc, old_font);
-        ReleaseDC(hwnd, hdc);
-        max_width
-    }
-}
-
-fn floating_text_slot_width(measured_width: i32) -> i32 {
-    (measured_width + sc(FLOATING_TEXT_RIGHT_PADDING)).clamp(
-        sc(FLOATING_MIN_TEXT_WIDTH),
-        sc(TEXT_WIDTH + FLOATING_TEXT_RIGHT_PADDING),
-    )
-}
-
 fn floating_monitor_size(hwnd: Option<HWND>) -> (i32, i32) {
-    let reserved_text_width = sc(TEXT_WIDTH);
-    let trailing_text_width = hwnd
-        .and_then(|hwnd| {
-            trailing_floating_widget()
-                .as_ref()
-                .and_then(|widget| measure_widget_text_width(hwnd, widget))
-        })
-        .map(floating_text_slot_width)
-        .unwrap_or(reserved_text_width);
-    let taskbar_only_width = sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN - FLOATING_CONTENT_LEFT_MARGIN)
-        + reserved_text_width
-        - trailing_text_width;
-    (total_widget_width() - taskbar_only_width, sc(WIDGET_HEIGHT))
+    let state = lock_state();
+    let Some(state) = state.as_ref() else {
+        return (sc(180), sc(52));
+    };
+    let scene = compact_scene_for_hwnd(
+        hwnd.unwrap_or_default(),
+        &state.compact_vm,
+        state.is_high_contrast,
+        true,
+    );
+    (sc(FLOATING_CONTENT_LEFT_MARGIN) + scene.width, scene.height)
+}
+
+const DWM_COLOR_NONE: u32 = 0xFFFF_FFFE;
+
+unsafe fn apply_floating_dwm_style(hwnd: HWND, is_dark: bool, high_contrast: bool) {
+    let corner = DWMWCP_ROUND;
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_WINDOW_CORNER_PREFERENCE,
+        &corner as *const _ as *const std::ffi::c_void,
+        std::mem::size_of_val(&corner) as u32,
+    );
+    let dark_mode = BOOL::from(is_dark);
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark_mode as *const _ as *const std::ffi::c_void,
+        std::mem::size_of_val(&dark_mode) as u32,
+    );
+    let border_color = if high_contrast {
+        theme::system_color(COLOR_WINDOWTEXT).to_colorref()
+    } else {
+        DWM_COLOR_NONE
+    };
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR,
+        &border_color as *const _ as *const std::ffi::c_void,
+        std::mem::size_of_val(&border_color) as u32,
+    );
 }
 
 fn floating_drag_distance_exceeded(delta_x: i32, delta_y: i32) -> bool {
@@ -3150,13 +3809,15 @@ fn ensure_floating_monitor_window() -> Option<HWND> {
                 return None;
             }
         };
-        let (title, stored_x, stored_y) = {
+        let (title, stored_x, stored_y, is_dark, high_contrast) = {
             let state = lock_state();
             let s = state.as_ref()?;
             (
                 s.language.strings().window_title,
                 s.floating_x,
                 s.floating_y,
+                s.is_dark,
+                s.is_high_contrast,
             )
         };
         let (width, height) = floating_monitor_size(None);
@@ -3196,13 +3857,7 @@ fn ensure_floating_monitor_window() -> Option<HWND> {
                 );
             }
         }
-        let corner = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner as *const _ as *const std::ffi::c_void,
-            std::mem::size_of_val(&corner) as u32,
-        );
+        apply_floating_dwm_style(hwnd, is_dark, high_contrast);
         {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
@@ -3303,17 +3958,6 @@ fn toggle_floating_monitor() {
     save_state_settings();
 }
 
-fn toggle_floating_lock() {
-    {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.floating_locked = !s.floating_locked;
-        }
-    }
-    save_state_settings();
-    refresh_floating_monitor(false);
-}
-
 fn reset_floating_position() {
     refresh_floating_monitor(true);
     save_state_settings();
@@ -3376,14 +4020,6 @@ unsafe fn floating_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_LBUTTONDOWN => {
-            let locked = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.floating_locked).unwrap_or(false)
-            };
-            if locked {
-                return LRESULT(0);
-            }
-
             let mut cursor = POINT::default();
             let mut rect = RECT::default();
             if GetCursorPos(&mut cursor).is_ok() && GetWindowRect(hwnd, &mut rect).is_ok() {
@@ -3527,27 +4163,27 @@ fn point_in_rect(x: i32, y: i32, rect: &RECT) -> bool {
 fn detail_close_rect(width: i32) -> RECT {
     RECT {
         left: width - sc(42),
-        top: sc(12),
+        top: sc(13),
         right: width - sc(16),
-        bottom: sc(38),
+        bottom: sc(39),
     }
 }
 
 fn detail_refresh_rect(width: i32) -> RECT {
     RECT {
         left: width - sc(74),
-        top: sc(12),
+        top: sc(13),
         right: width - sc(48),
-        bottom: sc(38),
+        bottom: sc(39),
     }
 }
 
 fn detail_move_rect(width: i32) -> RECT {
     RECT {
         left: width - sc(106),
-        top: sc(12),
+        top: sc(13),
         right: width - sc(80),
-        bottom: sc(38),
+        bottom: sc(39),
     }
 }
 
@@ -3603,11 +4239,15 @@ fn paint_detail_popup(hdc: HDC, hwnd: HWND) {
 /// across widget, tray icons and popup.
 struct DetailPalette {
     bg: Color,
+    card: Color,
     border: Color,
     divider: Color,
     text: Color,
     muted: Color,
+    degraded: Color,
     warn: Color,
+    warn_bg: Color,
+    warn_on_bg: Color,
     track: Color,
 }
 
@@ -3615,32 +4255,44 @@ fn detail_palette(is_dark: bool, high_contrast: bool) -> DetailPalette {
     if high_contrast {
         DetailPalette {
             bg: theme::system_color(COLOR_WINDOW),
+            card: theme::system_color(COLOR_WINDOW),
             border: theme::system_color(COLOR_WINDOWFRAME),
             divider: theme::system_color(COLOR_GRAYTEXT),
             text: theme::system_color(COLOR_WINDOWTEXT),
             muted: theme::system_color(COLOR_GRAYTEXT),
+            degraded: theme::system_color(COLOR_WINDOWTEXT),
             warn: theme::system_color(COLOR_HIGHLIGHT),
+            warn_bg: theme::system_color(COLOR_HIGHLIGHT),
+            warn_on_bg: theme::system_color(COLOR_HIGHLIGHTTEXT),
             track: theme::system_color(COLOR_GRAYTEXT),
         }
     } else if is_dark {
         DetailPalette {
             bg: Color::from_hex("#1F1F1F"),
-            border: Color::from_hex("#2E2E2E"),
-            divider: Color::from_hex("#343434"),
+            card: Color::from_hex("#242424"),
+            border: Color::from_hex("#353535"),
+            divider: Color::from_hex("#303030"),
             text: Color::from_hex("#F3F4F6"),
             muted: Color::from_hex("#9CA3AF"),
-            warn: Color::from_hex("#F87171"),
-            track: Color::from_hex("#3A3A3A"),
+            degraded: Color::from_hex("#D8A35D"),
+            warn: Color::from_hex("#FF5C66"),
+            warn_bg: Color::from_hex("#493033"),
+            warn_on_bg: Color::from_hex("#FF747C"),
+            track: Color::from_hex("#343434"),
         }
     } else {
         DetailPalette {
             bg: Color::from_hex("#F9F9F9"),
+            card: Color::from_hex("#FFFFFF"),
             border: Color::from_hex("#D4D4D8"),
             divider: Color::from_hex("#E4E4E7"),
             text: Color::from_hex("#1B1B1F"),
             muted: Color::from_hex("#6B7280"),
+            degraded: Color::from_hex("#946200"),
             warn: Color::from_hex("#DC2626"),
-            track: Color::from_hex("#E4E4E7"),
+            warn_bg: Color::from_hex("#FDECEC"),
+            warn_on_bg: Color::from_hex("#B91C1C"),
+            track: Color::from_hex("#E7E7EA"),
         }
     }
 }
@@ -3650,6 +4302,44 @@ fn provider_accent(kind: tray_icon::TrayIconKind, is_dark: bool, high_contrast: 
         tray_icon::TrayIconKind::Claude => claude_accent_color(high_contrast),
         tray_icon::TrayIconKind::Codex => codex_accent_color(is_dark, high_contrast),
         tray_icon::TrayIconKind::Antigravity => antigravity_accent_color(high_contrast),
+    }
+}
+
+/// Each brand mark keeps its real silhouette while the tile supplies a shared
+/// optical footprint. Codex deliberately uses the black OpenAI mark on a light
+/// tile in both themes, matching the reference and avoiding a generic app icon.
+fn provider_chip_style(
+    kind: tray_icon::TrayIconKind,
+    is_dark: bool,
+    high_contrast: bool,
+    palette: &DetailPalette,
+) -> (Color, Color, bool) {
+    if high_contrast {
+        return (palette.card, palette.border, is_dark);
+    }
+
+    match (kind, is_dark) {
+        (tray_icon::TrayIconKind::Claude, true) => {
+            (Color::from_hex("#30211E"), Color::from_hex("#70483D"), true)
+        }
+        (tray_icon::TrayIconKind::Claude, false) => (
+            Color::from_hex("#FFF0EA"),
+            Color::from_hex("#F1C8BA"),
+            false,
+        ),
+        (tray_icon::TrayIconKind::Codex, _) => (
+            Color::from_hex("#F7F7F5"),
+            Color::from_hex("#D4D4D0"),
+            false,
+        ),
+        (tray_icon::TrayIconKind::Antigravity, true) => {
+            (Color::from_hex("#172B4A"), Color::from_hex("#3C68A4"), true)
+        }
+        (tray_icon::TrayIconKind::Antigravity, false) => (
+            Color::from_hex("#E8F0FF"),
+            Color::from_hex("#BFD3FF"),
+            false,
+        ),
     }
 }
 
@@ -3699,7 +4389,7 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
             fill_rect_color(hdc, &edge, &palette.border);
         }
 
-        let margin = sc(20);
+        let margin = sc(18);
         draw_detail_text(
             hdc,
             &snapshot.title,
@@ -3710,8 +4400,8 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
                 bottom: sc(40),
             },
             &palette.text,
-            20,
-            FW_BOLD.0 as i32,
+            18,
+            FW_SEMIBOLD.0 as i32,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
 
@@ -3722,7 +4412,8 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
         let move_rect = detail_move_rect(width);
         let refresh_rect = detail_refresh_rect(width);
         let close_rect = detail_close_rect(width);
-        if hover == DETAIL_HOVER_MOVE || movement_unlocked {
+        let movement_locked = !movement_unlocked;
+        if hover == DETAIL_HOVER_MOVE || movement_locked {
             draw_rounded_rect(hdc, &move_rect, &palette.divider, sc(4));
         }
         if hover == DETAIL_HOVER_REFRESH {
@@ -3740,7 +4431,7 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
                 "\u{E72E}"
             },
             move_rect,
-            if movement_unlocked {
+            if hover == DETAIL_HOVER_MOVE || movement_locked {
                 &palette.text
             } else {
                 &palette.muted
@@ -3781,7 +4472,7 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
                     .map(|s| s.language.strings().detail_waiting)
                     .unwrap_or(LanguageId::English.strings().detail_waiting)
             };
-            draw_detail_text(
+            draw_detail_body_text(
                 hdc,
                 waiting,
                 RECT {
@@ -3791,7 +4482,7 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
                     bottom: y + sc(DETAIL_EMPTY_H),
                 },
                 &palette.muted,
-                14,
+                13,
                 FW_NORMAL.0 as i32,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
@@ -3813,17 +4504,17 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
             },
             &palette.divider,
         );
-        draw_detail_text(
+        draw_detail_body_text(
             hdc,
             &snapshot.status,
             RECT {
                 left: margin,
-                top: footer_top + sc(12),
+                top: footer_top + sc(8),
                 right: width - sc(74),
-                bottom: height - sc(10),
+                bottom: height - sc(6),
             },
             &palette.muted,
-            13,
+            11,
             FW_NORMAL.0 as i32,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -3832,20 +4523,21 @@ fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopu
             &format!("v{}", snapshot.version),
             RECT {
                 left: width - sc(74),
-                top: footer_top + sc(12),
+                top: footer_top + sc(8),
                 right: width - margin,
-                bottom: height - sc(10),
+                bottom: height - sc(6),
             },
             &palette.muted,
-            13,
+            11,
             FW_NORMAL.0 as i32,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
     }
 }
 
-/// One provider: a header line (accent dot, provider name, status badge)
-/// followed by one indented line pair per quota window.
+/// One provider card: a compact identity header sits above aligned quota rows.
+/// Warning groups add a slim left rail and a status pill without tinting the
+/// whole card, so the hierarchy stays readable at a glance.
 fn draw_detail_group(
     hdc: HDC,
     width: i32,
@@ -3855,101 +4547,250 @@ fn draw_detail_group(
     is_dark: bool,
     high_contrast: bool,
 ) {
-    let margin = sc(20);
-    let indent = margin + sc(18);
-    let accent = provider_accent(group.kind, is_dark, high_contrast);
-
-    // Accent dot, vertically centred on the header line.
-    let dot = sc(10);
-    let dot_top = group_y + (sc(DETAIL_GROUP_HEADER_H) - dot) / 2;
-    let dot_rect = RECT {
-        left: margin,
-        top: dot_top,
-        right: margin + dot,
-        bottom: dot_top + dot,
+    let card = RECT {
+        left: sc(DETAIL_CARD_MARGIN),
+        top: group_y,
+        right: width - sc(DETAIL_CARD_MARGIN),
+        bottom: group_y + sc(detail_group_height(group)),
     };
-    draw_rounded_rect(hdc, &dot_rect, &accent, dot / 2);
+    let card_radius = sc(8);
+    draw_rounded_rect(hdc, &card, &palette.border, card_radius);
+    draw_rounded_rect(
+        hdc,
+        &RECT {
+            left: card.left + sc(1),
+            top: card.top + sc(1),
+            right: card.right - sc(1),
+            bottom: card.bottom - sc(1),
+        },
+        &palette.card,
+        (card_radius - sc(1)).max(sc(1)),
+    );
+
+    let accent = provider_accent(group.kind, is_dark, high_contrast);
+    let group_warn = group.rows.iter().any(|row| row.warn)
+        || group
+            .badge
+            .as_ref()
+            .is_some_and(|badge| badge.tone == DetailBadgeTone::Critical);
+    if group_warn {
+        draw_rounded_rect(
+            hdc,
+            &RECT {
+                left: card.left,
+                top: card.top + sc(1),
+                right: card.left + sc(3),
+                bottom: card.bottom - sc(1),
+            },
+            &palette.warn,
+            sc(2),
+        );
+    }
+
+    // The warning rail nudges its card's content by 2px, as in the reference,
+    // while every bar/reset pair still shares one strict column grid.
+    let content_left = card.left + sc(14 + if group_warn { 2 } else { 0 });
+    let content_right = card.right - sc(12);
+    let header_top = card.top + sc(DETAIL_GROUP_PAD_V);
+    let header_bottom = header_top + sc(DETAIL_GROUP_HEADER_H);
+    let rows_y = header_bottom;
+    let row_label_left = content_left;
+    let bar_left = content_left + sc(30);
+    let percent_right = content_right;
+    let percent_text_width =
+        measure_detail_text_width(hdc, "100%", "Segoe UI", 16, FW_SEMIBOLD.0 as i32);
+    let percent_left = percent_right - detail_percent_column_width(percent_text_width);
+    let bar_right = percent_left - sc(4);
+
+    let chip = sc(DETAIL_LOGO_CHIP_SIZE);
+    let chip_left = content_left;
+    let chip_top = header_top + (sc(DETAIL_GROUP_HEADER_H) - chip) / 2;
+    let chip_radius = sc(7);
+    match provider_tile_icon(
+        group.kind,
+        active_window_dpi(),
+        is_dark,
+        high_contrast,
+        TileSize::Chip28,
+    ) {
+        Some((hicon, tile)) => unsafe {
+            debug_assert_eq!(tile, chip);
+            let _ = DrawIconEx(
+                hdc,
+                chip_left,
+                chip_top,
+                hicon,
+                tile,
+                tile,
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+        },
+        None => {
+            // High Contrast and decode failures stay palette-driven. Normal
+            // provider tiles are rendered offline so their rounded border and
+            // detailed mark share one supersampled antialiasing grid.
+            let (chip_bg, chip_border, _) =
+                provider_chip_style(group.kind, is_dark, high_contrast, palette);
+            draw_rounded_rect(
+                hdc,
+                &RECT {
+                    left: chip_left,
+                    top: chip_top,
+                    right: chip_left + chip,
+                    bottom: chip_top + chip,
+                },
+                &chip_border,
+                chip_radius,
+            );
+            draw_rounded_rect(
+                hdc,
+                &RECT {
+                    left: chip_left + sc(1),
+                    top: chip_top + sc(1),
+                    right: chip_left + chip - sc(1),
+                    bottom: chip_top + chip - sc(1),
+                },
+                &chip_bg,
+                (chip_radius - sc(1)).max(sc(1)),
+            );
+            let dot = sc(10);
+            let dot_left = chip_left + (chip - dot) / 2;
+            let dot_top = chip_top + (chip - dot) / 2;
+            draw_rounded_rect(
+                hdc,
+                &RECT {
+                    left: dot_left,
+                    top: dot_top,
+                    right: dot_left + dot,
+                    bottom: dot_top + dot,
+                },
+                &accent,
+                dot / 2,
+            );
+        }
+    }
+
+    let badge_layout = group.badge.as_ref().map(|badge| {
+        let text_width = measure_detail_text_width(
+            hdc,
+            &badge.text,
+            detail_body_face(&badge.text),
+            11,
+            FW_NORMAL.0 as i32,
+        );
+        let width = detail_badge_width(text_width, badge.tone);
+        let (badge_left, name_right) = detail_badge_horizontal_bounds(content_right, width);
+        (badge, width, badge_left, name_right)
+    });
+    let name_right = badge_layout
+        .as_ref()
+        .map(|(_, _, _, name_right)| *name_right)
+        .unwrap_or(content_right);
 
     draw_detail_text(
         hdc,
         &group.name,
         RECT {
-            left: indent,
-            top: group_y,
-            right: width / 2 + sc(40),
-            bottom: group_y + sc(DETAIL_GROUP_HEADER_H),
+            left: chip_left + chip + sc(8),
+            top: header_top,
+            right: name_right,
+            bottom: header_bottom,
         },
         &palette.text,
-        15,
+        16,
         FW_SEMIBOLD.0 as i32,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
 
-    if let Some((badge, badge_warn)) = &group.badge {
-        draw_detail_text(
-            hdc,
-            badge,
-            RECT {
-                left: width / 2,
-                top: group_y,
-                right: width - margin,
-                bottom: group_y + sc(DETAIL_GROUP_HEADER_H),
-            },
-            if *badge_warn {
-                &palette.warn
-            } else {
-                &palette.muted
-            },
-            12,
-            FW_NORMAL.0 as i32,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
+    if let Some((badge, badge_w, badge_left, _)) = badge_layout {
+        if badge.tone == DetailBadgeTone::Critical {
+            let badge_h = sc(22);
+            let badge_rect = RECT {
+                left: badge_left,
+                top: header_top + (sc(DETAIL_GROUP_HEADER_H) - badge_h) / 2,
+                right: content_right,
+                bottom: header_top + (sc(DETAIL_GROUP_HEADER_H) + badge_h) / 2,
+            };
+            draw_rounded_rect(hdc, &badge_rect, &palette.warn_bg, badge_h / 2);
+            draw_detail_body_text(
+                hdc,
+                &badge.text,
+                badge_rect,
+                &palette.warn_on_bg,
+                11,
+                FW_NORMAL.0 as i32,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        } else {
+            draw_detail_body_text(
+                hdc,
+                &badge.text,
+                RECT {
+                    left: content_right - badge_w,
+                    top: header_top,
+                    right: content_right,
+                    bottom: header_bottom,
+                },
+                if badge.tone == DetailBadgeTone::Degraded {
+                    &palette.degraded
+                } else {
+                    &palette.muted
+                },
+                11,
+                FW_NORMAL.0 as i32,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+        }
     }
 
-    let mut row_y = group_y + sc(DETAIL_GROUP_HEADER_H);
+    let mut row_y = rows_y;
     for row in &group.rows {
         let percent_text = match row.percent {
-            Some(percent) => format!("{percent:.0}%"),
+            Some(percent) => format!("{}%", compact_view::display_percent(percent)),
             None => "--".to_string(),
         };
         draw_detail_text(
             hdc,
             &row.window_label,
             RECT {
-                left: indent,
+                left: row_label_left,
                 top: row_y,
-                right: indent + sc(30),
-                bottom: row_y + sc(20),
+                right: bar_left - sc(2),
+                bottom: row_y + sc(DETAIL_PRIMARY_LINE_H),
             },
             &palette.muted,
-            13,
+            12,
             FW_NORMAL.0 as i32,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
         draw_detail_text(
             hdc,
             &percent_text,
             RECT {
-                left: width - margin - sc(52),
+                left: percent_left,
                 top: row_y,
-                right: width - margin,
-                bottom: row_y + sc(20),
+                right: percent_right,
+                bottom: row_y + sc(DETAIL_PRIMARY_LINE_H),
             },
             if row.warn {
                 &palette.warn
+            } else if detail_percent_is_display_zero(row.percent) {
+                &palette.muted
             } else {
                 &palette.text
             },
-            13,
-            FW_NORMAL.0 as i32,
+            16,
+            FW_SEMIBOLD.0 as i32,
             DT_RIGHT | DT_VCENTER | DT_SINGLELINE,
         );
 
         let bar_rect = RECT {
-            left: indent + sc(34),
-            top: row_y + sc(5),
-            right: width - margin - sc(58),
-            bottom: row_y + sc(15),
+            left: bar_left,
+            top: row_y + sc(4),
+            right: bar_right,
+            bottom: row_y + sc(14),
         };
         draw_detail_bar(
             hdc,
@@ -3958,25 +4799,50 @@ fn draw_detail_group(
             if row.warn { &palette.warn } else { &accent },
             &palette.track,
             row.dividers,
-            &palette.bg,
         );
 
-        draw_detail_text(
+        draw_detail_body_text(
             hdc,
             &row.reset_text,
             RECT {
-                left: indent + sc(34),
-                top: row_y + sc(21),
-                right: width - margin,
-                bottom: row_y + sc(40),
+                left: bar_left,
+                top: row_y + sc(20),
+                right: content_right,
+                bottom: row_y + sc(42),
             },
             &palette.muted,
-            12,
+            11,
             FW_NORMAL.0 as i32,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
 
         row_y += sc(DETAIL_WINDOW_ROW_H);
+    }
+}
+
+fn detail_bar_cell_rect(rect: &RECT, cell_count: i32, index: i32) -> RECT {
+    let cell_count = cell_count.max(1);
+    debug_assert!((0..cell_count).contains(&index));
+
+    let gap = if cell_count > 1 {
+        sc(DETAIL_BAR_GAP)
+    } else {
+        0
+    };
+    let span = rect.right - rect.left;
+    let left = rect.left + span * index / cell_count;
+    let boundary = rect.left + span * (index + 1) / cell_count;
+    let right = if index + 1 == cell_count {
+        rect.right
+    } else {
+        (boundary - gap).max(left + 1)
+    };
+
+    RECT {
+        left,
+        top: rect.top,
+        right,
+        bottom: rect.bottom,
     }
 }
 
@@ -3987,49 +4853,44 @@ fn draw_detail_bar(
     accent: &Color,
     track: &Color,
     dividers: i32,
-    bg: &Color,
 ) {
+    // The bar is split into `dividers` discrete cells (5 for the 5-hour window,
+    // 7 for the 7-day one - see usage_window_dividers), so the segment count
+    // echoes the window length and matches the taskbar widget's pip language.
+    // The fill stays continuous across the cells and the boundary cell fills
+    // proportionally, so a precise percentage still reads at low values.
     unsafe {
+        let n = dividers.max(1);
         let radius = sc(2);
-        draw_rounded_rect(hdc, rect, track, radius);
+        let span = rect.right - rect.left;
+        let fill_x = rect.left + ((span as f64) * percent.clamp(0.0, 100.0) / 100.0).round() as i32;
+        for i in 0..n {
+            let cell = detail_bar_cell_rect(rect, n, i);
+            draw_rounded_rect(hdc, &cell, track, radius);
 
-        let fill_width =
-            ((rect.right - rect.left) as f64 * percent.clamp(0.0, 100.0) / 100.0).round() as i32;
-        if fill_width > 0 {
-            let fill_rect = RECT {
-                left: rect.left,
-                top: rect.top,
-                right: (rect.left + fill_width).min(rect.right),
-                bottom: rect.bottom,
-            };
-            let rgn = CreateRoundRectRgn(
-                rect.left,
-                rect.top,
-                rect.right + 1,
-                rect.bottom + 1,
-                radius * 2,
-                radius * 2,
-            );
-            let _ = SelectClipRgn(hdc, rgn);
-            fill_rect_color(hdc, &fill_rect, accent);
-            let _ = SelectClipRgn(hdc, HRGN::default());
-            let _ = DeleteObject(rgn);
-        }
-
-        if dividers > 1 {
-            let divider_color = *bg;
-            for i in 1..dividers {
-                let x = rect.left + ((rect.right - rect.left) * i) / dividers;
+            let filled = (fill_x - cell.left).clamp(0, cell.right - cell.left);
+            if filled > 0 {
+                let rgn = CreateRoundRectRgn(
+                    cell.left,
+                    cell.top,
+                    cell.right + 1,
+                    cell.bottom + 1,
+                    radius * 2,
+                    radius * 2,
+                );
+                let _ = SelectClipRgn(hdc, rgn);
                 fill_rect_color(
                     hdc,
                     &RECT {
-                        left: x - sc(1),
-                        top: rect.top,
-                        right: x,
-                        bottom: rect.bottom,
+                        left: cell.left,
+                        top: cell.top,
+                        right: cell.left + filled,
+                        bottom: cell.bottom,
                     },
-                    &divider_color,
+                    accent,
                 );
+                let _ = SelectClipRgn(hdc, HRGN::default());
+                let _ = DeleteObject(rgn);
             }
         }
     }
@@ -4079,6 +4940,276 @@ fn cached_font(height_px: i32, weight: i32) -> HFONT {
     cached_font_named("Segoe UI", height_px, weight)
 }
 
+fn is_east_asian_character(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{3040}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+    )
+}
+
+fn detail_body_face(text: &str) -> &'static str {
+    if text.chars().any(|ch| matches!(ch, '\u{AC00}'..='\u{D7AF}')) {
+        "Malgun Gothic"
+    } else if text.chars().any(|ch| matches!(ch, '\u{3040}'..='\u{30FF}')) {
+        "Yu Gothic UI"
+    } else if text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+        )
+    }) {
+        "Microsoft YaHei UI"
+    } else {
+        "Segoe UI"
+    }
+}
+
+/// Complete provider tiles rendered at 8x from the pinned SVGs, then reduced
+/// with premultiplied-alpha Lanczos filtering. The final PNG combines the
+/// rounded background, border, and 19dp mark on one antialiasing grid.
+const PROVIDER_TILE_BUCKET_DPIS: [u32; 5] = [96, 120, 144, 168, 192];
+const PROVIDER_TILE_SIZES: [i32; 5] = [28, 35, 42, 49, 56];
+const PROVIDER_TILE_C20_SIZES: [i32; 5] = [20, 25, 30, 35, 40];
+const PROVIDER_TILE_C16_SIZES: [i32; 5] = [16, 20, 24, 28, 32];
+
+const PROVIDER_TILE_CLAUDE_DARK: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-192.png"),
+];
+const PROVIDER_TILE_CLAUDE_LIGHT: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-light-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-192.png"),
+];
+const PROVIDER_TILE_CLAUDE_DARK_C20: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c20-192.png"),
+];
+const PROVIDER_TILE_CLAUDE_LIGHT_C20: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c20-192.png"),
+];
+const PROVIDER_TILE_CLAUDE_DARK_C16: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-dark-c16-192.png"),
+];
+const PROVIDER_TILE_CLAUDE_LIGHT_C16: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/claude-light-c16-192.png"),
+];
+const PROVIDER_TILE_OPENAI: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/openai-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-192.png"),
+];
+const PROVIDER_TILE_OPENAI_C20: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/openai-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c20-192.png"),
+];
+const PROVIDER_TILE_OPENAI_C16: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/openai-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/openai-c16-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_DARK: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_LIGHT: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_DARK_C20: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c20-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_LIGHT_C20: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c20-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c20-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c20-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c20-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c20-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_DARK_C16: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-dark-c16-192.png"),
+];
+const PROVIDER_TILE_ANTIGRAVITY_LIGHT_C16: [&[u8]; 5] = [
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c16-96.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c16-120.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c16-144.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c16-168.png"),
+    include_bytes!("icons/providers/rendered/tiles/antigravity-light-c16-192.png"),
+];
+
+#[derive(Clone, Copy)]
+struct ProviderTileAsset {
+    bucket: usize,
+    size: i32,
+    bytes: &'static [u8],
+}
+
+fn nearest_provider_tile_bucket(dpi: u32) -> usize {
+    let dpi = normalize_dpi(dpi);
+    let mut best = 0;
+    let mut best_distance = dpi.abs_diff(PROVIDER_TILE_BUCKET_DPIS[0]);
+    for (index, bucket_dpi) in PROVIDER_TILE_BUCKET_DPIS.iter().enumerate().skip(1) {
+        let distance = dpi.abs_diff(*bucket_dpi);
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    }
+    best
+}
+
+fn provider_tile_asset(
+    kind: tray_icon::TrayIconKind,
+    dpi: u32,
+    is_dark: bool,
+    tile_size: TileSize,
+) -> ProviderTileAsset {
+    let bucket = nearest_provider_tile_bucket(dpi);
+    let bytes = match (kind, is_dark, tile_size) {
+        (tray_icon::TrayIconKind::Claude, true, TileSize::Chip28) => {
+            PROVIDER_TILE_CLAUDE_DARK[bucket]
+        }
+        (tray_icon::TrayIconKind::Claude, false, TileSize::Chip28) => {
+            PROVIDER_TILE_CLAUDE_LIGHT[bucket]
+        }
+        (tray_icon::TrayIconKind::Claude, true, TileSize::Chip20) => {
+            PROVIDER_TILE_CLAUDE_DARK_C20[bucket]
+        }
+        (tray_icon::TrayIconKind::Claude, false, TileSize::Chip20) => {
+            PROVIDER_TILE_CLAUDE_LIGHT_C20[bucket]
+        }
+        (tray_icon::TrayIconKind::Claude, true, TileSize::Chip16) => {
+            PROVIDER_TILE_CLAUDE_DARK_C16[bucket]
+        }
+        (tray_icon::TrayIconKind::Claude, false, TileSize::Chip16) => {
+            PROVIDER_TILE_CLAUDE_LIGHT_C16[bucket]
+        }
+        (tray_icon::TrayIconKind::Codex, _, TileSize::Chip28) => PROVIDER_TILE_OPENAI[bucket],
+        (tray_icon::TrayIconKind::Codex, _, TileSize::Chip20) => PROVIDER_TILE_OPENAI_C20[bucket],
+        (tray_icon::TrayIconKind::Codex, _, TileSize::Chip16) => PROVIDER_TILE_OPENAI_C16[bucket],
+        (tray_icon::TrayIconKind::Antigravity, true, TileSize::Chip28) => {
+            PROVIDER_TILE_ANTIGRAVITY_DARK[bucket]
+        }
+        (tray_icon::TrayIconKind::Antigravity, false, TileSize::Chip28) => {
+            PROVIDER_TILE_ANTIGRAVITY_LIGHT[bucket]
+        }
+        (tray_icon::TrayIconKind::Antigravity, true, TileSize::Chip20) => {
+            PROVIDER_TILE_ANTIGRAVITY_DARK_C20[bucket]
+        }
+        (tray_icon::TrayIconKind::Antigravity, false, TileSize::Chip20) => {
+            PROVIDER_TILE_ANTIGRAVITY_LIGHT_C20[bucket]
+        }
+        (tray_icon::TrayIconKind::Antigravity, true, TileSize::Chip16) => {
+            PROVIDER_TILE_ANTIGRAVITY_DARK_C16[bucket]
+        }
+        (tray_icon::TrayIconKind::Antigravity, false, TileSize::Chip16) => {
+            PROVIDER_TILE_ANTIGRAVITY_LIGHT_C16[bucket]
+        }
+    };
+    let (logical_size, size) = match tile_size {
+        TileSize::Chip16 => (16, PROVIDER_TILE_C16_SIZES[bucket]),
+        TileSize::Chip20 => (20, PROVIDER_TILE_C20_SIZES[bucket]),
+        TileSize::Chip28 => (28, PROVIDER_TILE_SIZES[bucket]),
+    };
+    debug_assert_eq!(
+        size,
+        scale_px_for_dpi(logical_size, PROVIDER_TILE_BUCKET_DPIS[bucket])
+    );
+    ProviderTileAsset {
+        bucket,
+        size,
+        bytes,
+    }
+}
+
+/// HICONs decoded from exact-DPI PNG tiles, keyed by provider, bucket and theme.
+/// Like the font cache, the popup repaints on every refresh, so caching a
+/// handful of handles beats decoding each frame. Windows Vista+ accepts PNG
+/// icon resource bits, so no runtime image dependency is required.
+type ProviderTileCacheEntry = ((tray_icon::TrayIconKind, usize, bool, TileSize), isize);
+static PROVIDER_TILE_CACHE: Mutex<Vec<ProviderTileCacheEntry>> = Mutex::new(Vec::new());
+
+fn provider_tile_icon(
+    kind: tray_icon::TrayIconKind,
+    dpi: u32,
+    is_dark: bool,
+    high_contrast: bool,
+    tile_size: TileSize,
+) -> Option<(HICON, i32)> {
+    if high_contrast {
+        return None;
+    }
+    let asset = provider_tile_asset(kind, dpi, is_dark, tile_size);
+    let mut cache = PROVIDER_TILE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key = (kind, asset.bucket, is_dark, tile_size);
+    if let Some((_, handle)) = cache.iter().find(|(cached_key, _)| *cached_key == key) {
+        return Some((HICON(*handle as *mut _), asset.size));
+    }
+    match unsafe {
+        CreateIconFromResourceEx(
+            asset.bytes,
+            TRUE,
+            0x0003_0000,
+            asset.size,
+            asset.size,
+            LR_DEFAULTCOLOR,
+        )
+    } {
+        Ok(hicon) => {
+            cache.push((key, hicon.0 as isize));
+            Some((hicon, asset.size))
+        }
+        Err(_) => None,
+    }
+}
+
 fn draw_detail_text(
     hdc: HDC,
     text: &str,
@@ -4089,6 +5220,69 @@ fn draw_detail_text(
     flags: DRAW_TEXT_FORMAT,
 ) {
     draw_detail_text_face(hdc, text, rect, color, "Segoe UI", font_size, weight, flags);
+}
+
+fn measure_detail_text_width(
+    hdc: HDC,
+    text: &str,
+    face: &'static str,
+    font_size: i32,
+    weight: i32,
+) -> i32 {
+    unsafe {
+        let font = cached_font_named(face, sc(font_size), weight);
+        let old_font = SelectObject(hdc, font);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let mut size = SIZE::default();
+        let measured = if wide.is_empty() || !GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool()
+        {
+            0
+        } else {
+            size.cx
+        };
+        SelectObject(hdc, old_font);
+        measured
+    }
+}
+
+fn detail_badge_width(measured_text_width: i32, tone: DetailBadgeTone) -> i32 {
+    let padding = if tone == DetailBadgeTone::Critical {
+        sc(20)
+    } else {
+        sc(2)
+    };
+    (measured_text_width + padding).clamp(sc(64), sc(104))
+}
+
+fn detail_badge_horizontal_bounds(content_right: i32, badge_width: i32) -> (i32, i32) {
+    let badge_left = content_right - badge_width;
+    (badge_left, badge_left - sc(8))
+}
+
+fn detail_percent_column_width(measured_text_width: i32) -> i32 {
+    (measured_text_width + sc(2)).clamp(sc(42), sc(48))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_detail_body_text(
+    hdc: HDC,
+    text: &str,
+    rect: RECT,
+    color: &Color,
+    font_size: i32,
+    weight: i32,
+    flags: DRAW_TEXT_FORMAT,
+) {
+    draw_detail_text_face(
+        hdc,
+        text,
+        rect,
+        color,
+        detail_body_face(text),
+        font_size,
+        weight,
+        flags,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4479,24 +5673,10 @@ fn set_startup_enabled(enable: bool) {
     }
 }
 
-// Dimensions matching the C# version
-const SEGMENT_W: i32 = 10;
-const SEGMENT_H: i32 = 13;
-const SEGMENT_GAP: i32 = 1;
-const SEGMENT_COUNT: i32 = 10;
-const CORNER_RADIUS: i32 = 2;
-
-const LEFT_DIVIDER_W: i32 = 3;
+const LEFT_DIVIDER_W: i32 = 5;
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
-const LABEL_WIDTH: i32 = 30;
-const LABEL_RIGHT_MARGIN: i32 = 6;
-const BAR_RIGHT_MARGIN: i32 = 4;
-// Fits the longest compact English forms (such as "100% · 59m" and
-// "100% · now") at Segoe UI 12px without making short values look sparse.
-// The floating window trims its final value slot to the measured text width.
-const TEXT_WIDTH: i32 = 64;
-const MODEL_RIGHT_MARGIN: i32 = 3;
-const RIGHT_MARGIN: i32 = 1;
+// Fits the longest compact English forms (such as "100%·59m" and
+// "100%·now") at Segoe UI 12px without making short values look sparse.
 const WIDGET_HEIGHT: i32 = 46;
 
 fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
@@ -4522,49 +5702,26 @@ fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity
     (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
 }
 
-fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
-    }
-}
-
 fn total_widget_width_for(active_models: i32) -> i32 {
-    let bar_segments = row_bar_segment_count(active_models);
-    let provider_width = sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN) + model_usage_width(bar_segments);
-
+    let metrics = compact_metrics();
+    let placeholder_width = sc(12);
+    let initial_pill_width =
+        metrics.pill_pad_x * 2 + metrics.chip16 + metrics.chip_gap + placeholder_width;
     sc(LEFT_DIVIDER_W)
         + sc(DIVIDER_RIGHT_MARGIN)
-        + provider_width * active_models
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+        + initial_pill_width * active_models
+        + metrics.badge_gap * (active_models - 1)
+        + metrics.badge_right_pad
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    let active_models = active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
+    let scene = compact_scene_for_hwnd(
+        state.hwnd.to_hwnd(),
+        &state.compact_vm,
+        state.is_high_contrast,
+        false,
     );
-    let segment_count = row_bar_segment_count(active_models);
-    let mut providers_width = 0;
-
-    if state.show_claude_code {
-        providers_width += provider_usage_width(segment_count, &state.claude_widget);
-    }
-    if state.show_codex {
-        providers_width += provider_usage_width(segment_count, &state.codex_widget);
-    }
-    if state.show_antigravity {
-        providers_width += provider_usage_width(segment_count, &state.antigravity_widget);
-    }
-
-    sc(LEFT_DIVIDER_W)
-        + sc(DIVIDER_RIGHT_MARGIN)
-        + providers_width
-        + sc(MODEL_RIGHT_MARGIN) * (active_models - 1)
-        + sc(RIGHT_MARGIN)
+    sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN) + scene.width
 }
 
 fn total_widget_width() -> i32 {
@@ -4573,6 +5730,719 @@ fn total_widget_width() -> i32 {
         .as_ref()
         .map(total_widget_width_for_state)
         .unwrap_or_else(|| total_widget_width_for(1))
+}
+
+fn sync_widget_tooltip_hits(scene: &Scene) {
+    lock_widget_tooltip_runtime().hits = scene.badge_hits.clone();
+}
+
+fn widget_tooltip_kind_at(client_x: i32, client_y: i32) -> Option<tray_icon::TrayIconKind> {
+    let origin_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+    lock_widget_tooltip_runtime()
+        .hits
+        .iter()
+        .find(|hit| {
+            client_x >= origin_x + hit.rect.x
+                && client_x < origin_x + hit.rect.x + hit.rect.w
+                && client_y >= hit.rect.y
+                && client_y < hit.rect.y + hit.rect.h
+        })
+        .map(|hit| hit.kind)
+}
+
+fn widget_tooltip_hwnd() -> Option<HWND> {
+    let state = lock_state();
+    state
+        .as_ref()
+        .and_then(|s| s.widget_tooltip_hwnd)
+        .map(SendHwnd::to_hwnd)
+        .filter(|hwnd| unsafe { IsWindow(*hwnd).as_bool() })
+}
+
+fn widget_tooltip_abbrev(kind: tray_icon::TrayIconKind) -> &'static str {
+    match kind {
+        tray_icon::TrayIconKind::Claude => "CL",
+        tray_icon::TrayIconKind::Codex => "CX",
+        tray_icon::TrayIconKind::Antigravity => "AG",
+    }
+}
+
+fn widget_tooltip_aux_text(row: &WidgetTooltipRow) -> String {
+    if row.percent_text.is_empty() {
+        row.reset_text.clone()
+    } else {
+        format!("· {}", row.reset_text)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WidgetTooltipLayout {
+    width: i32,
+    height: i32,
+    label_width: i32,
+    percent_width: i32,
+}
+
+fn widget_tooltip_layout(hdc: HDC, snapshot: &WidgetTooltipSnapshot) -> WidgetTooltipLayout {
+    let padding = sc(10);
+    let chip = sc(20);
+    let header_gap = sc(8);
+    let column_gap = sc(8);
+    let row_height = sc(20);
+    let header_width = chip
+        + header_gap
+        + measure_detail_text_width(
+            hdc,
+            &snapshot.provider_name,
+            detail_body_face(&snapshot.provider_name),
+            12,
+            FW_SEMIBOLD.0 as i32,
+        );
+    let label_width = snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            measure_detail_text_width(
+                hdc,
+                &row.window_label,
+                detail_body_face(&row.window_label),
+                12,
+                FW_NORMAL.0 as i32,
+            )
+        })
+        .max()
+        .unwrap_or_default();
+    let percent_width = snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            measure_detail_text_width(hdc, &row.percent_text, "Segoe UI", 12, FW_SEMIBOLD.0 as i32)
+        })
+        .max()
+        .unwrap_or_default();
+    let reset_width = snapshot
+        .rows
+        .iter()
+        .map(|row| {
+            let text = widget_tooltip_aux_text(row);
+            measure_detail_text_width(hdc, &text, detail_body_face(&text), 12, FW_NORMAL.0 as i32)
+        })
+        .max()
+        .unwrap_or_default();
+    let body_width = label_width
+        + usize::from(percent_width > 0) as i32 * column_gap
+        + percent_width
+        + column_gap
+        + reset_width;
+    let width = (padding * 2 + header_width.max(body_width))
+        .clamp(sc(WIDGET_TOOLTIP_MIN_WIDTH), sc(WIDGET_TOOLTIP_MAX_WIDTH));
+    let height = padding * 2 + chip + sc(6) + row_height * snapshot.rows.len() as i32;
+    WidgetTooltipLayout {
+        width,
+        height,
+        label_width,
+        percent_width,
+    }
+}
+
+fn paint_widget_tooltip(hdc: HDC, hwnd: HWND) {
+    let snapshot = lock_widget_tooltip_runtime().snapshot.clone();
+    let Some(snapshot) = snapshot else {
+        return;
+    };
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    paint_widget_tooltip_content(
+        hdc,
+        client.right - client.left,
+        client.bottom - client.top,
+        &snapshot,
+        theme::is_dark_mode(),
+        theme::is_high_contrast(),
+    );
+}
+
+fn paint_widget_tooltip_content(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    snapshot: &WidgetTooltipSnapshot,
+    is_dark: bool,
+    high_contrast: bool,
+) {
+    let palette = detail_palette(is_dark, high_contrast);
+    let client = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+    }
+    draw_rounded_rect(hdc, &client, &palette.border, sc(7));
+    draw_rounded_rect(
+        hdc,
+        &RECT {
+            left: sc(1),
+            top: sc(1),
+            right: client.right - sc(1),
+            bottom: client.bottom - sc(1),
+        },
+        &palette.card,
+        sc(6),
+    );
+
+    let layout = widget_tooltip_layout(hdc, snapshot);
+    let padding = sc(10);
+    let chip = sc(20);
+    let header_gap = sc(8);
+    let column_gap = sc(8);
+    let row_height = sc(20);
+    if let Some((icon, tile)) = provider_tile_icon(
+        snapshot.kind,
+        active_window_dpi(),
+        is_dark,
+        high_contrast,
+        TileSize::Chip20,
+    ) {
+        unsafe {
+            let _ = DrawIconEx(
+                hdc,
+                padding,
+                padding,
+                icon,
+                tile,
+                tile,
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+        }
+    } else {
+        let chip_rect = RECT {
+            left: padding,
+            top: padding,
+            right: padding + chip,
+            bottom: padding + chip,
+        };
+        draw_rounded_rect(hdc, &chip_rect, &palette.border, sc(5));
+        draw_rounded_rect(
+            hdc,
+            &RECT {
+                left: chip_rect.left + sc(1),
+                top: chip_rect.top + sc(1),
+                right: chip_rect.right - sc(1),
+                bottom: chip_rect.bottom - sc(1),
+            },
+            &palette.card,
+            sc(4),
+        );
+        draw_detail_text(
+            hdc,
+            widget_tooltip_abbrev(snapshot.kind),
+            chip_rect,
+            &palette.text,
+            9,
+            FW_SEMIBOLD.0 as i32,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+    }
+    draw_detail_body_text(
+        hdc,
+        &snapshot.provider_name,
+        RECT {
+            left: padding + chip + header_gap,
+            top: padding,
+            right: layout.width - padding,
+            bottom: padding + chip,
+        },
+        &palette.text,
+        12,
+        FW_SEMIBOLD.0 as i32,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+    );
+
+    let mut row_top = padding + chip + sc(6);
+    for row in &snapshot.rows {
+        let row_bottom = row_top + row_height;
+        let label_left = padding;
+        let percent_left = label_left + layout.label_width + column_gap;
+        let percent_right = percent_left + layout.percent_width;
+        let aux_left = if layout.percent_width > 0 {
+            percent_right + column_gap
+        } else {
+            label_left + layout.label_width + column_gap
+        };
+        draw_detail_body_text(
+            hdc,
+            &row.window_label,
+            RECT {
+                left: label_left,
+                top: row_top,
+                right: label_left + layout.label_width,
+                bottom: row_bottom,
+            },
+            &palette.muted,
+            12,
+            FW_NORMAL.0 as i32,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        if !row.percent_text.is_empty() {
+            draw_detail_text(
+                hdc,
+                &row.percent_text,
+                RECT {
+                    left: percent_left,
+                    top: row_top,
+                    right: percent_right,
+                    bottom: row_bottom,
+                },
+                if row.warn {
+                    &palette.warn
+                } else {
+                    &palette.text
+                },
+                12,
+                FW_SEMIBOLD.0 as i32,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        let aux_text = widget_tooltip_aux_text(row);
+        draw_detail_body_text(
+            hdc,
+            &aux_text,
+            RECT {
+                left: aux_left,
+                top: row_top,
+                right: layout.width - padding,
+                bottom: row_bottom,
+            },
+            &palette.muted,
+            12,
+            FW_NORMAL.0 as i32,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        row_top = row_bottom;
+    }
+}
+
+fn ensure_widget_tooltip_window_class() -> bool {
+    if WIDGET_TOOLTIP_CLASS_REGISTERED.load(Ordering::SeqCst) {
+        return true;
+    }
+    unsafe {
+        let hinstance = match GetModuleHandleW(PCWSTR::null()) {
+            Ok(handle) => handle,
+            Err(error) => {
+                diagnose::log_error("widget tooltip: GetModuleHandleW failed", error);
+                return false;
+            }
+        };
+        let class_name = native_interop::wide_str(WIDGET_TOOLTIP_WINDOW_CLASS_NAME);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(widget_tooltip_wnd_proc),
+            hInstance: HINSTANCE(hinstance.0),
+            hCursor: LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default(),
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        };
+        if RegisterClassExW(&wc) == 0 {
+            diagnose::log("widget tooltip: RegisterClassExW failed");
+            return false;
+        }
+    }
+    WIDGET_TOOLTIP_CLASS_REGISTERED.store(true, Ordering::SeqCst);
+    true
+}
+
+extern "system" fn widget_tooltip_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        widget_tooltip_wnd_proc_impl(hwnd, msg, wparam, lparam)
+    })) {
+        Ok(result) => result,
+        Err(_) => unsafe {
+            diagnose::log(format!(
+                "panic in widget_tooltip_wnd_proc msg={msg:#06x} (recovered)"
+            ));
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        },
+    }
+}
+
+unsafe fn widget_tooltip_wnd_proc_impl(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let _dpi_scope = DpiScope::for_window(hwnd);
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint_widget_tooltip(hdc, hwnd);
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT => {
+            paint_widget_tooltip(HDC(wparam.0 as *mut _), hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_DPICHANGED_MSG => {
+            let _message_dpi_scope = DpiScope::new(dpi_from_wparam(wparam));
+            apply_suggested_dpi_rect(hwnd, lparam, "widget tooltip");
+            let _ = InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+        WM_DESTROY => {
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                if s.widget_tooltip_hwnd
+                    .is_some_and(|stored| stored.to_hwnd() == hwnd)
+                {
+                    s.widget_tooltip_hwnd = None;
+                }
+            }
+            lock_widget_tooltip_runtime().snapshot = None;
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn ensure_widget_tooltip_window(owner: HWND) -> Option<HWND> {
+    if let Some(hwnd) = widget_tooltip_hwnd() {
+        return Some(hwnd);
+    }
+    if !ensure_widget_tooltip_window_class() {
+        return None;
+    }
+    unsafe {
+        let hinstance = GetModuleHandleW(PCWSTR::null()).ok()?;
+        let class_name = native_interop::wide_str(WIDGET_TOOLTIP_WINDOW_CLASS_NAME);
+        let tooltip = match CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                diagnose::log_error("widget tooltip: CreateWindowExW failed", error);
+                return None;
+            }
+        };
+        let (is_dark, high_contrast, owner_matches) = {
+            let state = lock_state();
+            match state.as_ref() {
+                Some(s) => (s.is_dark, s.is_high_contrast, s.hwnd.to_hwnd() == owner),
+                None => (false, false, false),
+            }
+        };
+        if !owner_matches {
+            let _ = DestroyWindow(tooltip);
+            return None;
+        }
+        apply_floating_dwm_style(tooltip, is_dark, high_contrast);
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.widget_tooltip_hwnd = Some(SendHwnd::from_hwnd(tooltip));
+        }
+        Some(tooltip)
+    }
+}
+
+fn widget_tooltip_anchor_rect(owner: HWND, kind: tray_icon::TrayIconKind) -> Option<RECT> {
+    let hit = lock_widget_tooltip_runtime()
+        .hits
+        .iter()
+        .find(|hit| hit.kind == kind)
+        .copied()?;
+    let mut owner_rect = RECT::default();
+    unsafe {
+        GetWindowRect(owner, &mut owner_rect).ok()?;
+    }
+    let origin_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
+    Some(RECT {
+        left: owner_rect.left + origin_x + hit.rect.x,
+        top: owner_rect.top + hit.rect.y,
+        right: owner_rect.left + origin_x + hit.rect.x + hit.rect.w,
+        bottom: owner_rect.top + hit.rect.y + hit.rect.h,
+    })
+}
+
+fn widget_tooltip_position_for_anchor(
+    anchor: RECT,
+    work: RECT,
+    width: i32,
+    height: i32,
+    gap: i32,
+) -> (i32, i32) {
+    let centered_x = anchor.left + (anchor.right - anchor.left - width) / 2;
+    let centered_y = anchor.top + (anchor.bottom - anchor.top - height) / 2;
+    let (x, y) = if anchor.top >= work.bottom {
+        (centered_x, anchor.top - gap - height)
+    } else if anchor.bottom <= work.top {
+        (centered_x, anchor.bottom + gap)
+    } else if anchor.left >= work.right {
+        (anchor.left - gap - width, centered_y)
+    } else if anchor.right <= work.left {
+        (anchor.right + gap, centered_y)
+    } else if anchor.top - work.top >= height + gap {
+        (centered_x, anchor.top - gap - height)
+    } else {
+        (centered_x, anchor.bottom + gap)
+    };
+    (
+        clamp_i32(x, work.left, work.right - width),
+        clamp_i32(y, work.top, work.bottom - height),
+    )
+}
+
+fn widget_tooltip_position(
+    owner: HWND,
+    kind: tray_icon::TrayIconKind,
+    width: i32,
+    height: i32,
+) -> Option<(i32, i32)> {
+    let anchor = widget_tooltip_anchor_rect(owner, kind)?;
+    let monitor = unsafe {
+        MonitorFromPoint(
+            POINT {
+                x: anchor.left + (anchor.right - anchor.left) / 2,
+                y: anchor.top + (anchor.bottom - anchor.top) / 2,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+    }
+    Some(widget_tooltip_position_for_anchor(
+        anchor,
+        info.rcWork,
+        width,
+        height,
+        sc(WIDGET_TOOLTIP_EDGE_GAP),
+    ))
+}
+
+unsafe fn hide_widget_tooltip(owner: HWND, clear_hover: bool) {
+    let _ = KillTimer(owner, TIMER_WIDGET_TOOLTIP);
+    if clear_hover {
+        lock_widget_tooltip_runtime().hover_kind = None;
+    }
+    if let Some(tooltip) = widget_tooltip_hwnd() {
+        let _ = ShowWindow(tooltip, SW_HIDE);
+    }
+}
+
+unsafe fn update_widget_tooltip_hover(owner: HWND, client_x: i32, client_y: i32) {
+    let next = widget_tooltip_kind_at(client_x, client_y);
+    let changed = {
+        let mut runtime = lock_widget_tooltip_runtime();
+        if runtime.hover_kind == next {
+            false
+        } else {
+            runtime.hover_kind = next;
+            true
+        }
+    };
+    if !changed {
+        return;
+    }
+    hide_widget_tooltip(owner, false);
+    if next.is_some() && SetTimer(owner, TIMER_WIDGET_TOOLTIP, WIDGET_TOOLTIP_DELAY_MS, None) == 0 {
+        diagnose::log("widget tooltip: unable to start hover timer");
+    }
+}
+
+unsafe fn show_widget_tooltip_for_hover(owner: HWND) {
+    let _ = KillTimer(owner, TIMER_WIDGET_TOOLTIP);
+    let expected = lock_widget_tooltip_runtime().hover_kind;
+    let Some(kind) = expected else {
+        return;
+    };
+    let mut cursor = POINT::default();
+    if GetCursorPos(&mut cursor).is_err() || !ScreenToClient(owner, &mut cursor).as_bool() {
+        hide_widget_tooltip(owner, true);
+        return;
+    }
+    if widget_tooltip_kind_at(cursor.x, cursor.y) != Some(kind) {
+        hide_widget_tooltip(owner, true);
+        return;
+    }
+
+    let snapshot = widget_tooltip_snapshot(kind);
+    lock_widget_tooltip_runtime().snapshot = Some(snapshot.clone());
+    let Some(tooltip) = ensure_widget_tooltip_window(owner) else {
+        return;
+    };
+    let _tooltip_dpi_scope = DpiScope::for_window(tooltip);
+    let hdc = GetDC(tooltip);
+    let layout = if hdc.0.is_null() {
+        WidgetTooltipLayout {
+            width: sc(240),
+            height: sc(56 + snapshot.rows.len() as i32 * 20),
+            label_width: sc(20),
+            percent_width: sc(36),
+        }
+    } else {
+        let layout = widget_tooltip_layout(hdc, &snapshot);
+        ReleaseDC(tooltip, hdc);
+        layout
+    };
+    let Some((x, y)) = widget_tooltip_position(owner, kind, layout.width, layout.height) else {
+        return;
+    };
+    let (is_dark, high_contrast) = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .map(|s| (s.is_dark, s.is_high_contrast))
+            .unwrap_or((false, false))
+    };
+    apply_floating_dwm_style(tooltip, is_dark, high_contrast);
+    let _ = SetWindowPos(
+        tooltip,
+        HWND_TOPMOST,
+        x,
+        y,
+        layout.width,
+        layout.height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    let _ = InvalidateRect(tooltip, None, false);
+    let _ = UpdateWindow(tooltip);
+}
+
+unsafe fn refresh_widget_tooltip_if_visible(owner: HWND) {
+    if widget_tooltip_hwnd().is_some_and(|tooltip| IsWindowVisible(tooltip).as_bool()) {
+        show_widget_tooltip_for_hover(owner);
+    }
+}
+
+fn compact_metrics() -> Metrics {
+    let logical = Metrics::logical();
+    Metrics {
+        taskbar_h: sc(logical.taskbar_h),
+        floating_h: sc(logical.floating_h),
+        pill_h: sc(logical.pill_h),
+        pill_pad_x: sc(logical.pill_pad_x),
+        chip16: sc(logical.chip16),
+        chip_gap: sc(logical.chip_gap),
+        badge_gap: sc(logical.badge_gap),
+        badge_right_pad: sc(logical.badge_right_pad),
+        badge_text_gap: sc(logical.badge_text_gap),
+        border_w: sc(logical.border_w).max(1),
+        status_w: sc(logical.status_w),
+        status_gap: sc(logical.status_gap),
+        chip20: sc(logical.chip20),
+        group_chip_gap: sc(logical.group_chip_gap),
+        label_min_w: sc(logical.label_min_w),
+        label_max_w: sc(logical.label_max_w),
+        label_gap: sc(logical.label_gap),
+        separator_w: sc(logical.separator_w),
+        row_text_h: sc(logical.row_text_h),
+        gauge_min_w: sc(logical.gauge_min_w),
+        gauge_h: sc(logical.gauge_h),
+        gauge_top_gap: sc(logical.gauge_top_gap),
+        unit_gap: sc(logical.unit_gap),
+        sep_margin: sc(logical.sep_margin),
+        sep_h: sc(logical.sep_h),
+        rows_left_pad: sc(logical.rows_left_pad),
+        rows_right_pad: sc(logical.rows_right_pad),
+    }
+}
+
+fn compact_font(key: FontKey) -> HFONT {
+    match key {
+        FontKey::Data12 => cached_font(sc(12), FW_MEDIUM.0 as i32),
+    }
+}
+
+fn measure_compact_text(hdc: HDC, font: FontKey, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let old_font = SelectObject(hdc, compact_font(font));
+        let wide = text.encode_utf16().collect::<Vec<_>>();
+        let mut size = SIZE::default();
+        let measured = if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+            size.cx
+        } else {
+            0
+        };
+        SelectObject(hdc, old_font);
+        measured
+    }
+}
+
+fn compact_scene(hdc: HDC, vm: &CompactViewModel, high_contrast: bool, floating: bool) -> Scene {
+    let metrics = compact_metrics();
+    let measure = |font, text: &str| measure_compact_text(hdc, font, text);
+    if floating {
+        compact_layout::layout_provider_rows(vm, &metrics, high_contrast, &measure)
+    } else {
+        compact_layout::layout_badges(vm, &metrics, high_contrast, &measure)
+    }
+}
+
+fn compact_scene_for_hwnd(
+    hwnd: HWND,
+    vm: &CompactViewModel,
+    high_contrast: bool,
+    floating: bool,
+) -> Scene {
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.0.is_null() {
+            let metrics = compact_metrics();
+            let fallback = |font: FontKey, text: &str| {
+                let logical_per_char = match font {
+                    FontKey::Data12 => 6,
+                };
+                sc(logical_per_char * text.chars().count() as i32)
+            };
+            return if floating {
+                compact_layout::layout_provider_rows(vm, &metrics, high_contrast, &fallback)
+            } else {
+                compact_layout::layout_badges(vm, &metrics, high_contrast, &fallback)
+            };
+        }
+        let scene = compact_scene(hdc, vm, high_contrast, floating);
+        ReleaseDC(hwnd, hdc);
+        scene
+    }
 }
 
 fn claude_accent_color(high_contrast: bool) -> Color {
@@ -4601,54 +6471,14 @@ fn antigravity_accent_color(high_contrast: bool) -> Color {
     }
 }
 
-fn claude_usage_text_color(is_dark: bool, high_contrast: bool) -> Color {
-    if high_contrast {
-        theme::system_color(COLOR_WINDOWTEXT)
-    } else if is_dark {
-        Color::from_hex("#F09A7A")
-    } else {
-        Color::from_hex("#A94F32")
-    }
-}
-
-fn codex_usage_text_color(is_dark: bool, high_contrast: bool) -> Color {
-    if high_contrast {
-        theme::system_color(COLOR_WINDOWTEXT)
-    } else if is_dark {
-        Color::from_hex("#F5F5F5")
-    } else {
-        Color::from_hex("#1F1F1F")
-    }
-}
-
-fn antigravity_usage_text_color(is_dark: bool, high_contrast: bool) -> Color {
-    if high_contrast {
-        theme::system_color(COLOR_WINDOWTEXT)
-    } else if is_dark {
-        Color::from_hex("#8AB4F8")
-    } else {
-        Color::from_hex("#1967D2")
-    }
-}
-
 struct WidgetPalette {
     bg: Color,
-    text: Color,
-    track: Color,
-    claude: Color,
-    codex: Color,
-    antigravity: Color,
 }
 
 fn widget_palette(is_dark: bool, high_contrast: bool) -> WidgetPalette {
     if high_contrast {
         WidgetPalette {
             bg: theme::system_color(COLOR_WINDOW),
-            text: theme::system_color(COLOR_WINDOWTEXT),
-            track: theme::system_color(COLOR_GRAYTEXT),
-            claude: claude_accent_color(true),
-            codex: codex_accent_color(is_dark, true),
-            antigravity: antigravity_accent_color(true),
         }
     } else {
         WidgetPalette {
@@ -4657,21 +6487,305 @@ fn widget_palette(is_dark: bool, high_contrast: bool) -> WidgetPalette {
             } else {
                 Color::from_hex("#F3F3F3")
             },
-            text: if is_dark {
-                Color::from_hex("#888888")
-            } else {
-                Color::from_hex("#404040")
-            },
-            track: if is_dark {
-                Color::from_hex("#444444")
-            } else {
-                Color::from_hex("#AAAAAA")
-            },
-            claude: claude_accent_color(false),
-            codex: codex_accent_color(is_dark, false),
-            antigravity: antigravity_accent_color(false),
         }
     }
+}
+
+fn compact_color(key: ColorKey, is_dark: bool, high_contrast: bool) -> Color {
+    if high_contrast {
+        return match key {
+            ColorKey::PillBg | ColorKey::GaugeTrack => theme::system_color(COLOR_WINDOW),
+            ColorKey::PillBgWarn | ColorKey::GaugeWarn => theme::system_color(COLOR_HIGHLIGHT),
+            ColorKey::PillAlertText => theme::system_color(COLOR_HIGHLIGHTTEXT),
+            ColorKey::CanvasWarnPrimary | ColorKey::CanvasWarnSecondary => {
+                theme::system_color(COLOR_WINDOWTEXT)
+            }
+            ColorKey::GaugeAccent(_) => theme::system_color(COLOR_HIGHLIGHT),
+            ColorKey::AuxText | ColorKey::Separator => theme::system_color(COLOR_GRAYTEXT),
+            ColorKey::PillText
+            | ColorKey::NeutralText
+            | ColorKey::HighContrastText
+            | ColorKey::ErrorText => theme::system_color(COLOR_WINDOWTEXT),
+        };
+    }
+
+    match key {
+        ColorKey::PillBg => {
+            if is_dark {
+                Color::from_hex("#2B2B2B")
+            } else {
+                Color::from_hex("#E3E3E3")
+            }
+        }
+        ColorKey::PillBgWarn => {
+            if is_dark {
+                Color::from_hex("#422A2E")
+            } else {
+                Color::from_hex("#FDECEC")
+            }
+        }
+        ColorKey::PillText => {
+            if is_dark {
+                Color::from_hex("#E3E3E3")
+            } else {
+                Color::from_hex("#1F1F1F")
+            }
+        }
+        ColorKey::PillAlertText | ColorKey::CanvasWarnPrimary | ColorKey::ErrorText => {
+            if is_dark {
+                Color::from_hex("#FF747C")
+            } else {
+                Color::from_hex("#B91C1C")
+            }
+        }
+        ColorKey::CanvasWarnSecondary => {
+            if is_dark {
+                Color::from_hex("#C97F84")
+            } else {
+                Color::from_hex("#A14B50")
+            }
+        }
+        ColorKey::AuxText => {
+            if is_dark {
+                Color::from_hex("#9A9A9A")
+            } else {
+                Color::from_hex("#6E6E6E")
+            }
+        }
+        ColorKey::NeutralText => {
+            if is_dark {
+                Color::from_hex("#E8E8E8")
+            } else {
+                Color::from_hex("#1F1F1F")
+            }
+        }
+        ColorKey::GaugeTrack => {
+            if is_dark {
+                Color::from_hex("#3A3A3A")
+            } else {
+                Color::from_hex("#C9C9C9")
+            }
+        }
+        ColorKey::GaugeAccent(kind) => match kind {
+            tray_icon::TrayIconKind::Claude => claude_accent_color(false),
+            tray_icon::TrayIconKind::Codex => codex_accent_color(is_dark, false),
+            tray_icon::TrayIconKind::Antigravity => antigravity_accent_color(false),
+        },
+        ColorKey::GaugeWarn => {
+            if is_dark {
+                Color::from_hex("#FF5C66")
+            } else {
+                Color::from_hex("#DC2626")
+            }
+        }
+        ColorKey::Separator => {
+            if is_dark {
+                Color::from_hex("#2E2E2E")
+            } else {
+                Color::from_hex("#DADADA")
+            }
+        }
+        ColorKey::HighContrastText => theme::system_color(COLOR_WINDOWTEXT),
+    }
+}
+
+fn offset_compact_rect(rect: compact_layout::Rect, x: i32, y: i32) -> RECT {
+    RECT {
+        left: rect.x + x,
+        top: rect.y + y,
+        right: rect.x + x + rect.w,
+        bottom: rect.y + y + rect.h,
+    }
+}
+
+fn render_compact_scene(
+    hdc: HDC,
+    scene: &Scene,
+    origin_x: i32,
+    origin_y: i32,
+    is_dark: bool,
+    high_contrast: bool,
+) {
+    unsafe {
+        let _ = SetBkMode(hdc, TRANSPARENT);
+        for command in &scene.cmds {
+            match command {
+                DrawCmd::RoundRect {
+                    rect,
+                    color,
+                    radius,
+                } => {
+                    let rect = offset_compact_rect(*rect, origin_x, origin_y);
+                    if rect.right > rect.left && rect.bottom > rect.top {
+                        if *radius <= 0 {
+                            fill_rect_color(
+                                hdc,
+                                &rect,
+                                &compact_color(*color, is_dark, high_contrast),
+                            );
+                        } else {
+                            draw_rounded_rect(
+                                hdc,
+                                &rect,
+                                &compact_color(*color, is_dark, high_contrast),
+                                *radius,
+                            );
+                        }
+                    }
+                }
+                DrawCmd::StrokeRoundRect {
+                    rect,
+                    color,
+                    radius,
+                    width,
+                } => {
+                    let rect = offset_compact_rect(*rect, origin_x, origin_y);
+                    let brush = CreateSolidBrush(COLORREF(
+                        compact_color(*color, is_dark, high_contrast).to_colorref(),
+                    ));
+                    let region = CreateRoundRectRgn(
+                        rect.left,
+                        rect.top,
+                        rect.right + 1,
+                        rect.bottom + 1,
+                        radius * 2,
+                        radius * 2,
+                    );
+                    let _ = FrameRgn(hdc, region, brush, (*width).max(1), (*width).max(1));
+                    let _ = DeleteObject(region);
+                    let _ = DeleteObject(brush);
+                }
+                DrawCmd::GaugeFill {
+                    track,
+                    fraction,
+                    color,
+                    radius,
+                } => {
+                    let mut rect = offset_compact_rect(*track, origin_x, origin_y);
+                    rect.right = rect.left
+                        + ((track.w as f64 * fraction.clamp(0.0, 1.0)).round() as i32)
+                            .clamp(1, track.w);
+                    draw_rounded_rect(
+                        hdc,
+                        &rect,
+                        &compact_color(*color, is_dark, high_contrast),
+                        (*radius).min((rect.right - rect.left) / 2),
+                    );
+                }
+                DrawCmd::Text {
+                    rect,
+                    text,
+                    font,
+                    color,
+                } => {
+                    if text.is_empty() || rect.w <= 0 || rect.h <= 0 {
+                        continue;
+                    }
+                    let old_font = SelectObject(hdc, compact_font(*font));
+                    let _ = SetTextColor(
+                        hdc,
+                        COLORREF(compact_color(*color, is_dark, high_contrast).to_colorref()),
+                    );
+                    let mut rect = offset_compact_rect(*rect, origin_x, origin_y);
+                    let mut wide = text.encode_utf16().collect::<Vec<_>>();
+                    let _ = DrawTextW(
+                        hdc,
+                        &mut wide,
+                        &mut rect,
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                    SelectObject(hdc, old_font);
+                }
+                DrawCmd::ProviderTile { rect, kind, size } => {
+                    if let Some((icon, _)) = provider_tile_icon(
+                        *kind,
+                        active_window_dpi(),
+                        is_dark,
+                        high_contrast,
+                        *size,
+                    ) {
+                        let rect = offset_compact_rect(*rect, origin_x, origin_y);
+                        let _ = DrawIconEx(
+                            hdc,
+                            rect.left,
+                            rect.top,
+                            icon,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            0,
+                            HBRUSH::default(),
+                            DI_NORMAL,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_drag_divider(hdc: HDC, height: i32, is_dark: bool, high_contrast: bool) {
+    let divider_h = sc(25);
+    let divider_top = (height - divider_h) / 2;
+    let divider_bottom = divider_top + divider_h;
+    let (left, right) = if high_contrast {
+        (
+            theme::system_color(COLOR_WINDOWTEXT),
+            theme::system_color(COLOR_GRAYTEXT),
+        )
+    } else if is_dark {
+        (Color::new(62, 62, 62), Color::new(34, 34, 34))
+    } else {
+        (Color::new(176, 176, 176), Color::new(226, 226, 226))
+    };
+    fill_rect_color(
+        hdc,
+        &RECT {
+            left: sc(2),
+            top: divider_top,
+            right: sc(3),
+            bottom: divider_bottom,
+        },
+        &left,
+    );
+    fill_rect_color(
+        hdc,
+        &RECT {
+            left: sc(3),
+            top: divider_top,
+            right: sc(4),
+            bottom: divider_bottom,
+        },
+        &right,
+    );
+}
+
+fn paint_compact_surface(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    scene: &Scene,
+    floating: bool,
+    is_dark: bool,
+    high_contrast: bool,
+) {
+    let palette = widget_palette(is_dark, high_contrast);
+    fill_rect_color(
+        hdc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        &palette.bg,
+    );
+    let origin_x = if floating {
+        sc(FLOATING_CONTENT_LEFT_MARGIN)
+    } else {
+        draw_drag_divider(hdc, height, is_dark, high_contrast);
+        sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN)
+    };
+    render_compact_scene(hdc, scene, origin_x, 0, is_dark, high_contrast);
 }
 
 /// Register and create the hidden broadcast helper window (see
@@ -5120,9 +7234,16 @@ pub fn run() {
                 language_override,
                 language,
                 install_channel,
-                claude_widget: placeholder_widget("--"),
-                codex_widget: placeholder_widget("--"),
-                antigravity_widget: placeholder_widget("--"),
+                claude_widget: placeholder_widget(),
+                codex_widget: placeholder_widget(),
+                antigravity_widget: placeholder_widget(),
+                compact_vm: compact_view::placeholder_model(
+                    "--",
+                    &settings.provider_order,
+                    settings.show_claude_code,
+                    settings.show_codex,
+                    settings.show_antigravity,
+                ),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
@@ -5148,10 +7269,10 @@ pub fn run() {
                 details_hwnd: None,
                 floating_hwnd: None,
                 floating_visible: settings.floating_visible,
-                floating_locked: settings.floating_locked,
                 detailed_tray_icons: settings.detailed_tray_icons,
                 floating_x: settings.floating_x,
                 floating_y: settings.floating_y,
+                widget_tooltip_hwnd: None,
                 taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
                 preferred_taskbar_index: settings.taskbar_index,
@@ -5305,19 +7426,7 @@ pub fn run() {
 /// Renders fully opaque with the actual taskbar background colour so that
 /// ClearType sub-pixel font rendering can be used for crisp, OS-native text.
 fn render_layered() {
-    let (
-        hwnd_val,
-        is_dark,
-        high_contrast,
-        embedded,
-        claude_widget,
-        codex_widget,
-        antigravity_widget,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        provider_order,
-    ) = {
+    let (hwnd_val, is_dark, high_contrast, embedded, compact_vm) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
@@ -5325,13 +7434,7 @@ fn render_layered() {
                 s.is_dark,
                 s.is_high_contrast,
                 s.embedded,
-                s.claude_widget.clone(),
-                s.codex_widget.clone(),
-                s.antigravity_widget.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.provider_order.clone(),
+                s.compact_vm.clone(),
             ),
             None => return,
         }
@@ -5339,6 +7442,11 @@ fn render_layered() {
 
     let hwnd = hwnd_val.to_hwnd();
     let _dpi_scope = DpiScope::for_window(hwnd);
+    let tooltip_scene = compact_scene_for_hwnd(hwnd, &compact_vm, high_contrast, false);
+    sync_widget_tooltip_hits(&tooltip_scene);
+    unsafe {
+        refresh_widget_tooltip_if_visible(hwnd);
+    }
 
     // For non-embedded fallback, just invalidate and let WM_PAINT handle it
     if !embedded {
@@ -5349,7 +7457,7 @@ fn render_layered() {
     }
 
     let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
+    let height = sc(Metrics::logical().taskbar_h);
 
     let palette = widget_palette(is_dark, high_contrast);
 
@@ -5382,32 +7490,12 @@ fn render_layered() {
 
         let old_bmp = SelectObject(mem_dc, dib);
         let pixel_count = (width * height) as usize;
+        let scene = compact_scene(mem_dc, &compact_vm, high_contrast, false);
 
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
         // sub-pixel font rendering that matches the rest of the OS.
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            high_contrast,
-            &palette.bg,
-            &palette.text,
-            &palette.claude,
-            &palette.track,
-            &claude_widget,
-            &codex_widget,
-            &antigravity_widget,
-            true,
-            DIVIDER_RIGHT_MARGIN,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &provider_order,
-            &palette.codex,
-            &palette.antigravity,
-        );
+        paint_compact_surface(mem_dc, width, height, &scene, false, is_dark, high_contrast);
 
         // Background pixels -> alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels -> fully opaque (preserves ClearType sub-pixel rendering).
@@ -5455,148 +7543,6 @@ fn render_layered() {
     }
 }
 
-/// Paint all widget content onto a DC with a given background color.
-// GDI drawing parameters stay explicit to avoid hiding ownership/lifetime
-// details in a large temporary render object.
-#[allow(clippy::too_many_arguments)]
-fn paint_content(
-    hdc: HDC,
-    width: i32,
-    height: i32,
-    is_dark: bool,
-    high_contrast: bool,
-    bg: &Color,
-    text_color: &Color,
-    accent: &Color,
-    track: &Color,
-    claude_widget: &ProviderWidgetData,
-    codex_widget: &ProviderWidgetData,
-    antigravity_widget: &ProviderWidgetData,
-    show_left_divider: bool,
-    content_left_margin: i32,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-    provider_order: &[tray_icon::TrayIconKind],
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-) {
-    unsafe {
-        let client_rect = RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: height,
-        };
-
-        let bg_brush = CreateSolidBrush(COLORREF(bg.to_colorref()));
-        FillRect(hdc, &client_rect, bg_brush);
-        let _ = DeleteObject(bg_brush);
-
-        let content_x = if show_left_divider {
-            let divider_h = sc(25);
-            let divider_top = (height - divider_h) / 2;
-            let divider_bottom = divider_top + divider_h;
-
-            let (div_left, div_right) = if high_contrast {
-                (
-                    theme::system_color(COLOR_WINDOWTEXT),
-                    theme::system_color(COLOR_GRAYTEXT),
-                )
-            } else if is_dark {
-                (Color::new(80, 80, 80), Color::new(40, 40, 40))
-            } else {
-                (Color::new(160, 160, 160), Color::new(230, 230, 230))
-            };
-
-            let left_brush = CreateSolidBrush(COLORREF(div_left.to_colorref()));
-            let left_rect = RECT {
-                left: 0,
-                top: divider_top,
-                right: sc(2),
-                bottom: divider_bottom,
-            };
-            FillRect(hdc, &left_rect, left_brush);
-            let _ = DeleteObject(left_brush);
-
-            let right_brush = CreateSolidBrush(COLORREF(div_right.to_colorref()));
-            let right_rect = RECT {
-                left: sc(2),
-                top: divider_top,
-                right: sc(3),
-                bottom: divider_bottom,
-            };
-            FillRect(hdc, &right_rect, right_brush);
-            let _ = DeleteObject(right_brush);
-
-            sc(LEFT_DIVIDER_W) + sc(content_left_margin)
-        } else {
-            sc(content_left_margin)
-        };
-
-        let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-
-        let font = cached_font(sc(12), FW_MEDIUM.0 as i32);
-        let old_font = SelectObject(hdc, font);
-
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
-        let segment_count = row_bar_segment_count(active_models);
-        let use_model_text_colors = active_models > 1 && !high_contrast;
-        let claude_value_color = if use_model_text_colors {
-            claude_usage_text_color(is_dark, high_contrast)
-        } else {
-            *text_color
-        };
-        let codex_value_color = if use_model_text_colors {
-            codex_usage_text_color(is_dark, high_contrast)
-        } else {
-            *text_color
-        };
-        let antigravity_value_color = if use_model_text_colors {
-            antigravity_usage_text_color(is_dark, high_contrast)
-        } else {
-            *text_color
-        };
-        let providers = provider_order
-            .iter()
-            .filter_map(|kind| match kind {
-                tray_icon::TrayIconKind::Claude if show_claude_code => {
-                    Some((claude_widget, accent, &claude_value_color))
-                }
-                tray_icon::TrayIconKind::Codex if show_codex => {
-                    Some((codex_widget, codex_accent, &codex_value_color))
-                }
-                tray_icon::TrayIconKind::Antigravity if show_antigravity => Some((
-                    antigravity_widget,
-                    antigravity_accent,
-                    &antigravity_value_color,
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let provider_count = providers.len();
-        let mut model_x = content_x;
-        for (index, (widget, provider_accent, value_color)) in providers.into_iter().enumerate() {
-            draw_provider_usage(
-                hdc,
-                model_x,
-                height,
-                segment_count,
-                widget,
-                provider_accent,
-                track,
-                value_color,
-            );
-            if index + 1 < provider_count {
-                model_x += provider_usage_width(segment_count, widget) + sc(MODEL_RIGHT_MARGIN);
-            }
-        }
-
-        SelectObject(hdc, old_font);
-    }
-}
-
 fn poll_controller_hwnd() -> HWND {
     let helper = BROADCAST_HELPER_HWND.load(Ordering::Acquire);
     if helper != 0 {
@@ -5625,6 +7571,10 @@ fn post_usage_updated() {
 }
 
 fn request_poll() {
+    request_poll_with(false);
+}
+
+fn request_poll_with(force_claude_refresh: bool) {
     if QUIT_REQUESTED.load(Ordering::Acquire) {
         return;
     }
@@ -5634,7 +7584,7 @@ fn request_poll() {
     // this lock, no newer request can make that result stale mid-commit.
     let should_start_worker = {
         let _state = lock_state();
-        POLL_COORDINATOR.request()
+        POLL_COORDINATOR.request(force_claude_refresh)
     };
     if should_start_worker {
         std::thread::spawn(poll_worker);
@@ -5643,8 +7593,8 @@ fn request_poll() {
 
 fn poll_worker() {
     loop {
-        let generation = POLL_COORDINATOR.begin_pass();
-        do_poll(generation);
+        let (generation, force_claude_refresh) = POLL_COORDINATOR.begin_pass();
+        do_poll(generation, force_claude_refresh);
         if !POLL_COORDINATOR.finish_pass() {
             break;
         }
@@ -5652,7 +7602,7 @@ fn poll_worker() {
     }
 }
 
-fn do_poll(generation: u64) {
+fn do_poll(generation: u64, force_claude_refresh: bool) {
     let controller_hwnd = poll_controller_hwnd();
     let main_hwnd = current_main_hwnd();
     let (show_claude_code, show_codex, show_antigravity) = {
@@ -5663,7 +7613,12 @@ fn do_poll(generation: u64) {
             .unwrap_or((true, false, false))
     };
 
-    match poller::poll(show_claude_code, show_codex, show_antigravity) {
+    match poller::poll(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        force_claude_refresh,
+    ) {
         Ok(mut data) => {
             let updated_unix = now_unix_secs();
             stamp_provider_updates(&mut data, updated_unix);
@@ -5740,10 +7695,13 @@ fn do_poll(generation: u64) {
                         let _ = KillTimer(controller_hwnd, TIMER_RESET_POLL);
                         SetTimer(controller_hwnd, TIMER_POLL, retry_ms, None);
                     }
-                } else if s.retry_count > 0 {
+                } else {
                     s.retry_count = 0;
                     let interval = s.poll_interval_ms;
                     unsafe {
+                        // Re-arm from completion instead of keeping the old
+                        // periodic phase. Claude can then reach its 180s/120s
+                        // eligibility deadline without sampling just before it.
                         SetTimer(controller_hwnd, TIMER_POLL, interval, None);
                     }
                 }
@@ -5951,22 +7909,28 @@ fn schedule_countdown_timer() {
 fn check_theme_change() {
     let new_dark = theme::is_dark_mode();
     let new_high_contrast = theme::is_high_contrast();
-    let (changed, hwnd) = {
+    let (changed, hwnd, floating_hwnd) = {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
             if s.is_dark != new_dark || s.is_high_contrast != new_high_contrast {
                 s.is_dark = new_dark;
                 s.is_high_contrast = new_high_contrast;
-                (true, Some(s.hwnd.to_hwnd()))
+                (true, Some(s.hwnd.to_hwnd()), s.floating_hwnd)
             } else {
-                (false, None)
+                (false, None, None)
             }
         } else {
-            (false, None)
+            (false, None, None)
         }
     };
     if changed {
         render_layered();
+        if let Some(floating_hwnd) = floating_hwnd {
+            unsafe {
+                apply_floating_dwm_style(floating_hwnd, new_dark, new_high_contrast);
+                let _ = InvalidateRect(floating_hwnd, None, false);
+            }
+        }
         // The tray icons and the detail popup follow the theme too.
         if let Some(hwnd) = hwnd {
             sync_tray_icons(hwnd);
@@ -6340,6 +8304,9 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                     let _ = KillTimer(hwnd, TIMER_TRAY_ORDER_CONFIRM);
                     refresh_provider_order_from_tray(hwnd);
                 }
+                TIMER_WIDGET_TOOLTIP => {
+                    show_widget_tooltip_for_hover(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -6370,6 +8337,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
+            hide_widget_tooltip(hwnd, true);
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
             let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             if !is_drag_handle_point(client_x, client_y) {
@@ -6389,6 +8357,16 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            update_widget_tooltip_hover(hwnd, client_x, client_y);
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
             let is_dragging = {
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
@@ -6489,6 +8467,10 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             }
             LRESULT(0)
         }
+        WM_MOUSELEAVE_MSG => {
+            hide_widget_tooltip(hwnd, true);
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
@@ -6538,6 +8520,7 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            hide_widget_tooltip(hwnd, true);
             show_context_menu(hwnd);
             LRESULT(0)
         }
@@ -6735,9 +8718,6 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 IDM_TOGGLE_FLOATING => {
                     toggle_floating_monitor();
                 }
-                IDM_LOCK_FLOATING => {
-                    toggle_floating_lock();
-                }
                 IDM_RESET_FLOATING_POSITION => {
                     reset_floating_position();
                 }
@@ -6762,12 +8742,28 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
             LRESULT(0)
         }
         WM_DESTROY => {
-            let hook = {
+            let _ = KillTimer(hwnd, TIMER_WIDGET_TOOLTIP);
+            {
+                let mut runtime = lock_widget_tooltip_runtime();
+                runtime.hover_kind = None;
+                runtime.hits.clear();
+                runtime.snapshot = None;
+            }
+            let (hook, tooltip) = {
                 let mut state = lock_state();
-                state.as_mut().and_then(|s| s.win_event_hook.take())
+                match state.as_mut() {
+                    Some(s) => (s.win_event_hook.take(), s.widget_tooltip_hwnd.take()),
+                    None => (None, None),
+                }
             };
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
+            }
+            if let Some(tooltip) = tooltip {
+                let tooltip = tooltip.to_hwnd();
+                if IsWindow(tooltip).as_bool() {
+                    let _ = DestroyWindow(tooltip);
+                }
             }
             let _ = WTSUnRegisterSessionNotification(hwnd);
             tray_icon::remove_all(hwnd);
@@ -6802,7 +8798,6 @@ fn show_context_menu(hwnd: HWND) {
             update_status,
             widget_visible,
             floating_visible,
-            floating_locked,
             detailed_tray_icons,
             show_claude_code,
             show_codex,
@@ -6821,7 +8816,6 @@ fn show_context_menu(hwnd: HWND) {
                     s.update_status.clone(),
                     s.widget_visible,
                     s.floating_visible,
-                    s.floating_locked,
                     s.detailed_tray_icons,
                     s.show_claude_code,
                     s.show_codex,
@@ -6837,7 +8831,6 @@ fn show_context_menu(hwnd: HWND) {
                     InstallChannel::Portable,
                     UpdateStatus::Idle,
                     true,
-                    false,
                     false,
                     true,
                     true,
@@ -6980,18 +8973,6 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_widget_label.as_ptr()),
-        );
-        let floating_lock_label = native_interop::wide_str(strings.lock_floating_position);
-        let floating_lock_flags = if floating_locked {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            settings_menu,
-            floating_lock_flags,
-            IDM_LOCK_FLOATING as usize,
-            PCWSTR::from_raw(floating_lock_label.as_ptr()),
         );
         let reset_floating_label = native_interop::wide_str(strings.reset_floating_position);
         let _ = AppendMenuW(
@@ -7187,37 +9168,18 @@ fn show_context_menu(hwnd: HWND) {
 
 fn paint(hdc: HDC, hwnd: HWND) {
     let _dpi_scope = DpiScope::for_window(hwnd);
-    let (
-        is_dark,
-        high_contrast,
-        claude_widget,
-        codex_widget,
-        antigravity_widget,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        provider_order,
-        is_floating,
-    ) = {
+    let (is_dark, high_contrast, compact_vm, is_floating) = {
         let state = lock_state();
         match state.as_ref() {
             Some(s) => (
                 s.is_dark,
                 s.is_high_contrast,
-                s.claude_widget.clone(),
-                s.codex_widget.clone(),
-                s.antigravity_widget.clone(),
-                s.show_claude_code,
-                s.show_codex,
-                s.show_antigravity,
-                s.provider_order.clone(),
+                s.compact_vm.clone(),
                 s.floating_hwnd.is_some_and(|stored| stored.0 == hwnd.0),
             ),
             None => return,
         }
     };
-
-    let palette = widget_palette(is_dark, high_contrast);
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -7232,32 +9194,16 @@ fn paint(hdc: HDC, hwnd: HWND) {
         let mem_dc = CreateCompatibleDC(hdc);
         let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem_dc, mem_bmp);
+        let scene = compact_scene(mem_dc, &compact_vm, high_contrast, is_floating);
 
-        paint_content(
+        paint_compact_surface(
             mem_dc,
             width,
             height,
+            &scene,
+            is_floating,
             is_dark,
             high_contrast,
-            &palette.bg,
-            &palette.text,
-            &palette.claude,
-            &palette.track,
-            &claude_widget,
-            &codex_widget,
-            &antigravity_widget,
-            false,
-            if is_floating {
-                FLOATING_CONTENT_LEFT_MARGIN
-            } else {
-                DIVIDER_RIGHT_MARGIN
-            },
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            &provider_order,
-            &palette.codex,
-            &palette.antigravity,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -7265,174 +9211,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(mem_bmp);
         let _ = DeleteDC(mem_dc);
-    }
-}
-
-fn provider_label_width(widget: &ProviderWidgetData) -> i32 {
-    if widget.windows.iter().any(|window| !window.label.is_empty()) {
-        sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN)
-    } else {
-        0
-    }
-}
-
-fn provider_usage_width(segment_count: i32, widget: &ProviderWidgetData) -> i32 {
-    provider_label_width(widget) + model_usage_width(segment_count)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_provider_usage(
-    hdc: HDC,
-    x: i32,
-    height: i32,
-    segment_count: i32,
-    widget: &ProviderWidgetData,
-    accent: &Color,
-    track: &Color,
-    text_color: &Color,
-) {
-    let windows = widget.windows.iter().take(2).collect::<Vec<_>>();
-    let label_width = provider_label_width(widget);
-    if windows.is_empty() {
-        return;
-    }
-    let row2_y = height - sc(5) - sc(SEGMENT_H);
-    let row1_y = row2_y - sc(10) - sc(SEGMENT_H);
-    let single_height = sc(SEGMENT_H);
-    let single_y = (height - single_height) / 2;
-    let positions = if windows.len() == 1 {
-        vec![(single_y, single_height)]
-    } else {
-        vec![(row1_y, sc(SEGMENT_H)), (row2_y, sc(SEGMENT_H))]
-    };
-
-    for (window, (y, row_height)) in windows.into_iter().zip(positions) {
-        if !window.label.is_empty() {
-            // DrawTextW must not receive an empty mutable UTF-16 buffer.
-            unsafe {
-                let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-                let mut label_wide: Vec<u16> = window.label.encode_utf16().collect();
-                let mut label_rect = RECT {
-                    left: x,
-                    top: y,
-                    right: x + sc(LABEL_WIDTH),
-                    bottom: y + row_height,
-                };
-                let _ = DrawTextW(
-                    hdc,
-                    &mut label_wide,
-                    &mut label_rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                );
-            }
-        }
-        draw_usage_bar(
-            hdc,
-            x + label_width,
-            y,
-            row_height,
-            segment_count,
-            window.percent,
-            &window.text,
-            accent,
-            track,
-            text_color,
-        );
-    }
-}
-
-fn model_usage_width(segment_count: i32) -> i32 {
-    (sc(SEGMENT_W) + sc(SEGMENT_GAP)) * segment_count - sc(SEGMENT_GAP)
-        + sc(BAR_RIGHT_MARGIN)
-        + sc(TEXT_WIDTH)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_usage_bar(
-    hdc: HDC,
-    bar_x: i32,
-    y: i32,
-    segment_height: i32,
-    segment_count: i32,
-    percent: Option<f64>,
-    text: &str,
-    accent: &Color,
-    track: &Color,
-    text_color: &Color,
-) {
-    let seg_w = sc(SEGMENT_W);
-    let seg_h = segment_height;
-    let seg_gap = sc(SEGMENT_GAP);
-    let corner_r = sc(CORNER_RADIUS);
-
-    unsafe {
-        let segment_percent = 100.0 / segment_count as f64;
-        if let Some(percent_clamped) = percent.map(|percent| percent.clamp(0.0, 100.0)) {
-            for i in 0..segment_count {
-                let seg_x = bar_x + i * (seg_w + seg_gap);
-                let seg_start = (i as f64) * segment_percent;
-                let seg_end = seg_start + segment_percent;
-
-                let seg_rect = RECT {
-                    left: seg_x,
-                    top: y,
-                    right: seg_x + seg_w,
-                    bottom: y + seg_h,
-                };
-
-                if percent_clamped >= seg_end {
-                    draw_rounded_rect(hdc, &seg_rect, accent, corner_r);
-                } else if percent_clamped <= seg_start {
-                    draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                } else {
-                    draw_rounded_rect(hdc, &seg_rect, track, corner_r);
-                    let fraction = (percent_clamped - seg_start) / segment_percent;
-                    let fill_width = (seg_w as f64 * fraction) as i32;
-                    if fill_width > 0 {
-                        let fill_rect = RECT {
-                            left: seg_x,
-                            top: y,
-                            right: seg_x + fill_width,
-                            bottom: y + seg_h,
-                        };
-                        let rgn = CreateRoundRectRgn(
-                            seg_rect.left,
-                            seg_rect.top,
-                            seg_rect.right + 1,
-                            seg_rect.bottom + 1,
-                            corner_r * 2,
-                            corner_r * 2,
-                        );
-                        let _ = SelectClipRgn(hdc, rgn);
-                        let brush = CreateSolidBrush(COLORREF(accent.to_colorref()));
-                        FillRect(hdc, &fill_rect, brush);
-                        let _ = DeleteObject(brush);
-                        let _ = SelectClipRgn(hdc, HRGN::default());
-                        let _ = DeleteObject(rgn);
-                    }
-                }
-            }
-        }
-
-        let text_x = if percent.is_some() {
-            bar_x + segment_count * (seg_w + seg_gap) - seg_gap + sc(BAR_RIGHT_MARGIN)
-        } else {
-            bar_x
-        };
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(TEXT_WIDTH),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
     }
 }
 
@@ -7457,6 +9235,65 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 mod reset_notification_tests {
     use super::*;
 
+    struct OwnedIconInfoBitmaps {
+        color: HBITMAP,
+        mask: HBITMAP,
+    }
+
+    impl Drop for OwnedIconInfoBitmaps {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.color.is_invalid() {
+                    let _ = DeleteObject(self.color);
+                }
+                if !self.mask.is_invalid() {
+                    let _ = DeleteObject(self.mask);
+                }
+            }
+        }
+    }
+
+    fn hicon_color_bitmap_metrics(hicon: HICON) -> (i32, i32, u16) {
+        unsafe {
+            let mut info = ICONINFO::default();
+            GetIconInfo(hicon, &mut info).expect("GetIconInfo");
+            let bitmaps = OwnedIconInfoBitmaps {
+                color: info.hbmColor,
+                mask: info.hbmMask,
+            };
+            assert!(
+                !bitmaps.color.is_invalid(),
+                "provider PNG should produce a color HBITMAP"
+            );
+
+            let mut bitmap = BITMAP::default();
+            let copied = GetObjectW(
+                bitmaps.color,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(std::ptr::addr_of_mut!(bitmap).cast()),
+            );
+            assert_eq!(
+                copied,
+                std::mem::size_of::<BITMAP>() as i32,
+                "GetObjectW(BITMAP)"
+            );
+
+            (bitmap.bmWidth, bitmap.bmHeight, bitmap.bmBitsPixel)
+        }
+    }
+
+    fn png_ihdr(bytes: &[u8]) -> (u32, u32, u8, u8) {
+        assert!(bytes.len() >= 26);
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(&bytes[12..16], b"IHDR");
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+            bytes[24],
+            bytes[25],
+        )
+    }
+
     #[test]
     fn dpi_scaling_is_window_local_and_restored_after_nested_scope() {
         assert_eq!(scale_px_for_dpi(16, 96), 16);
@@ -7475,6 +9312,46 @@ mod reset_notification_tests {
             assert_eq!(sc(16), 24);
         }
         assert_eq!(sc(16), baseline);
+    }
+
+    #[test]
+    fn compact_high_contrast_text_roles_match_their_backdrops() {
+        let system = |index| theme::system_color(index).to_colorref();
+        let resolved = |key| compact_color(key, true, true).to_colorref();
+
+        assert_eq!(
+            resolved(ColorKey::PillAlertText),
+            system(COLOR_HIGHLIGHTTEXT)
+        );
+        assert_eq!(
+            resolved(ColorKey::CanvasWarnPrimary),
+            system(COLOR_WINDOWTEXT)
+        );
+        assert_eq!(
+            resolved(ColorKey::CanvasWarnSecondary),
+            system(COLOR_WINDOWTEXT)
+        );
+        assert_eq!(
+            resolved(ColorKey::HighContrastText),
+            system(COLOR_WINDOWTEXT)
+        );
+        assert_eq!(resolved(ColorKey::ErrorText), system(COLOR_WINDOWTEXT));
+        assert_eq!(resolved(ColorKey::PillBgWarn), system(COLOR_HIGHLIGHT));
+        assert_eq!(resolved(ColorKey::PillBg), system(COLOR_WINDOW));
+
+        assert_ne!(
+            resolved(ColorKey::PillAlertText),
+            resolved(ColorKey::PillBgWarn)
+        );
+        assert_ne!(
+            resolved(ColorKey::CanvasWarnPrimary),
+            resolved(ColorKey::PillBg)
+        );
+        assert_ne!(
+            resolved(ColorKey::CanvasWarnSecondary),
+            resolved(ColorKey::PillBg)
+        );
+        assert_ne!(resolved(ColorKey::ErrorText), resolved(ColorKey::PillBg));
     }
 
     #[test]
@@ -7507,6 +9384,106 @@ mod reset_notification_tests {
         assert_eq!(
             app_tooltip_provider_line("Claude Code", Some(&usage), LanguageId::English.strings()),
             "Claude Code: 5h 85% · 7d 78%"
+        );
+    }
+
+    #[test]
+    fn widget_tooltip_lines_keep_every_reported_window() {
+        let usage = UsageData::from_windows(vec![
+            UsageWindow::new(53.0, None, Some(FIVE_HOURS_SECONDS)),
+            UsageWindow::new(20.0, None, Some(ONE_WEEK_SECONDS)),
+            UsageWindow::new(7.0, None, Some(24 * 60 * 60)),
+        ]);
+        let lines = provider_tooltip_lines(
+            "Claude Code",
+            usage.windows.iter(),
+            LanguageId::English.strings(),
+        );
+
+        assert_eq!(lines, ["Claude Code", "5h: 53%", "1d: 7%", "7d: 20%"]);
+    }
+
+    #[test]
+    fn widget_tooltip_reset_copy_is_relative_and_unwrapped() {
+        let resets_at = SystemTime::now()
+            .checked_add(Duration::from_secs(6 * 60 * 60 + 11 * 60))
+            .unwrap();
+        let text = widget_tooltip_reset_text(resets_at, LanguageId::English.strings());
+
+        assert!(text.starts_with("Resets in "));
+        assert!(!text.contains('('));
+        assert!(!text.contains(')'));
+    }
+
+    #[test]
+    fn widget_tooltip_position_tracks_all_taskbar_edges() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1_000,
+            bottom: 700,
+        };
+        let size = (200, 80);
+
+        assert_eq!(
+            widget_tooltip_position_for_anchor(
+                RECT {
+                    left: 400,
+                    top: 700,
+                    right: 500,
+                    bottom: 740,
+                },
+                work,
+                size.0,
+                size.1,
+                7,
+            ),
+            (350, 613)
+        );
+        assert_eq!(
+            widget_tooltip_position_for_anchor(
+                RECT {
+                    left: 400,
+                    top: -40,
+                    right: 500,
+                    bottom: 0,
+                },
+                work,
+                size.0,
+                size.1,
+                7,
+            ),
+            (350, 7)
+        );
+        assert_eq!(
+            widget_tooltip_position_for_anchor(
+                RECT {
+                    left: 1_000,
+                    top: 300,
+                    right: 1_040,
+                    bottom: 400,
+                },
+                work,
+                size.0,
+                size.1,
+                7,
+            ),
+            (793, 310)
+        );
+        assert_eq!(
+            widget_tooltip_position_for_anchor(
+                RECT {
+                    left: -40,
+                    top: 300,
+                    right: 0,
+                    bottom: 400,
+                },
+                work,
+                size.0,
+                size.1,
+                7,
+            ),
+            (7, 310)
         );
     }
 
@@ -7546,60 +9523,74 @@ mod reset_notification_tests {
     }
 
     #[test]
-    fn floating_trailing_text_slot_shrinks_but_keeps_safe_bounds() {
-        let _dpi = DpiScope::new(96);
-
-        assert_eq!(floating_text_slot_width(10), FLOATING_MIN_TEXT_WIDTH);
-        assert_eq!(floating_text_slot_width(40), 46);
-        assert_eq!(
-            floating_text_slot_width(100),
-            TEXT_WIDTH + FLOATING_TEXT_RIGHT_PADDING
-        );
+    fn compact_gdi_data_font_fits_supported_dpis() {
+        for dpi in PROVIDER_TILE_BUCKET_DPIS {
+            let _dpi = DpiScope::new(dpi);
+            unsafe {
+                let hdc = GetDC(HWND::default());
+                assert!(!hdc.0.is_null());
+                let metrics = compact_metrics();
+                assert!(
+                    measure_compact_text(hdc, FontKey::Data12, "5h 100% ·4d") > 0,
+                    "compact data font did not measure at {dpi} DPI"
+                );
+                assert!(
+                    measure_compact_text(hdc, FontKey::Data12, "365d") <= metrics.label_max_w,
+                    "floating label exceeds its measured slot at {dpi} DPI"
+                );
+                ReleaseDC(HWND::default(), hdc);
+            }
+        }
     }
 
     #[test]
     fn poll_coordinator_coalesces_requests_and_marks_old_generation_stale() {
         let coordinator = PollCoordinator::new();
 
-        assert!(coordinator.request());
-        let first_generation = coordinator.begin_pass();
+        assert!(coordinator.request(false));
+        let (first_generation, force_claude_refresh) = coordinator.begin_pass();
+        assert!(!force_claude_refresh);
         assert!(coordinator.is_current(first_generation));
 
-        assert!(!coordinator.request());
-        assert!(!coordinator.request());
+        assert!(!coordinator.request(false));
+        assert!(!coordinator.request(true));
         assert!(!coordinator.is_current(first_generation));
         assert!(coordinator.finish_pass());
 
-        let latest_generation = coordinator.begin_pass();
+        let (latest_generation, force_claude_refresh) = coordinator.begin_pass();
+        assert!(force_claude_refresh);
         assert!(coordinator.is_current(latest_generation));
         assert!(!coordinator.finish_pass());
 
-        assert!(coordinator.request());
+        assert!(coordinator.request(false));
     }
 
     #[test]
     fn poll_coordinator_releases_worker_when_no_request_is_pending() {
         let coordinator = PollCoordinator::new();
 
-        assert!(coordinator.request());
-        let generation = coordinator.begin_pass();
+        assert!(coordinator.request(false));
+        let (generation, force_claude_refresh) = coordinator.begin_pass();
+        assert!(!force_claude_refresh);
         assert!(coordinator.is_current(generation));
         assert!(!coordinator.finish_pass());
-        assert!(coordinator.request());
+        assert!(coordinator.request(false));
     }
 
     #[test]
     fn poll_coordinator_invalidation_discards_active_and_pending_work() {
         let coordinator = PollCoordinator::new();
-        assert!(coordinator.request());
-        let generation = coordinator.begin_pass();
-        assert!(!coordinator.request());
+        assert!(coordinator.request(false));
+        let (generation, _) = coordinator.begin_pass();
+        assert!(!coordinator.request(true));
 
         coordinator.invalidate_pending();
 
         assert!(!coordinator.is_current(generation));
         assert!(!coordinator.finish_pass());
-        assert!(coordinator.request());
+        assert!(coordinator.request(false));
+        let (_, force_claude_refresh) = coordinator.begin_pass();
+        assert!(!force_claude_refresh);
     }
 
     #[test]
@@ -7719,15 +9710,13 @@ mod reset_notification_tests {
     }
 
     #[test]
-    fn weekly_only_codex_usage_renders_without_redundant_window_label() {
+    fn weekly_only_codex_usage_feeds_the_tray_percent() {
         let usage =
             UsageData::from_windows(vec![UsageWindow::new(1.0, None, Some(ONE_WEEK_SECONDS))]);
-        let widget = provider_widget_from_usage(Some(&usage), LanguageId::English.strings(), true);
+        let widget = provider_widget_from_usage(Some(&usage));
 
         assert_eq!(widget.windows.len(), 1);
-        assert_eq!(widget.windows[0].label, "");
         assert_eq!(widget.windows[0].percent, Some(1.0));
-        assert_eq!(widget.windows[0].text, "1%");
     }
 
     #[test]
@@ -7737,28 +9726,11 @@ mod reset_notification_tests {
             UsageWindow::new(92.0, None, Some(24 * 60 * 60)),
             UsageWindow::new(10.0, None, Some(ONE_WEEK_SECONDS)),
         ]);
-        let widget = provider_widget_from_usage(Some(&usage), LanguageId::English.strings(), false);
+        let widget = provider_widget_from_usage(Some(&usage));
 
         assert_eq!(widget.windows.len(), 2);
-        assert_eq!(widget.windows[0].label, "5h");
-        assert_eq!(widget.windows[1].label, "1d");
-    }
-
-    #[test]
-    fn hidden_provider_labels_reclaim_the_label_column() {
-        let usage = UsageData::from_windows(vec![
-            UsageWindow::new(10.0, None, Some(FIVE_HOURS_SECONDS)),
-            UsageWindow::new(20.0, None, Some(ONE_WEEK_SECONDS)),
-        ]);
-        let strings = LanguageId::English.strings();
-        let labeled = provider_widget_from_usage(Some(&usage), strings, false);
-        let compact = provider_widget_from_usage(Some(&usage), strings, true);
-
-        assert!(compact.windows.iter().all(|window| window.label.is_empty()));
-        assert_eq!(
-            provider_usage_width(4, &labeled) - provider_usage_width(4, &compact),
-            sc(LABEL_WIDTH) + sc(LABEL_RIGHT_MARGIN)
-        );
+        assert_eq!(widget.windows[0].percent, Some(91.0));
+        assert_eq!(widget.windows[1].percent, Some(92.0));
     }
 
     #[test]
@@ -7768,9 +9740,18 @@ mod reset_notification_tests {
         let thirty_minutes = UsageWindow::new(0.0, None, Some(30 * 60));
         let strings = LanguageId::Korean.strings();
 
-        assert_eq!(compact_usage_window_label(&five_hours, strings), "5h");
-        assert_eq!(compact_usage_window_label(&seven_days, strings), "7d");
-        assert_eq!(compact_usage_window_label(&thirty_minutes, strings), "30m");
+        assert_eq!(
+            compact_view::compact_usage_window_label(&five_hours, strings),
+            "5h"
+        );
+        assert_eq!(
+            compact_view::compact_usage_window_label(&seven_days, strings),
+            "7d"
+        );
+        assert_eq!(
+            compact_view::compact_usage_window_label(&thirty_minutes, strings),
+            "30m"
+        );
         assert_eq!(usage_window_label(&five_hours, strings), "5시간");
     }
 
@@ -7786,6 +9767,7 @@ mod reset_notification_tests {
             "Codex",
             Some(&usage),
             None,
+            false,
             LanguageId::English.strings(),
         );
 
@@ -7793,6 +9775,346 @@ mod reset_notification_tests {
         assert_eq!(group.rows[0].window_label, "5h");
         assert_eq!(group.rows[1].window_label, "1d");
         assert_eq!(group.rows[2].window_label, "7d");
+    }
+
+    #[test]
+    fn detail_percent_rounding_and_warning_share_one_value() {
+        for (percent, displayed, warns) in [
+            (-1.0, 0, false),
+            (89.4, 89, false),
+            (89.6, 90, true),
+            (100.4, 100, true),
+        ] {
+            assert_eq!(compact_view::display_percent(percent), displayed);
+            let window = UsageWindow::new(percent, None, Some(FIVE_HOURS_SECONDS));
+            let row = detail_usage_row(
+                "5h".to_string(),
+                Some(&window),
+                None,
+                5,
+                LanguageId::English.strings(),
+            );
+            assert_eq!(row.warn, warns);
+        }
+    }
+
+    #[test]
+    fn detail_zero_tone_follows_the_displayed_percentage() {
+        assert!(!detail_percent_is_display_zero(None));
+        assert!(detail_percent_is_display_zero(Some(0.0)));
+        assert!(detail_percent_is_display_zero(Some(0.4)));
+        assert!(!detail_percent_is_display_zero(Some(0.5)));
+    }
+
+    #[test]
+    fn detail_provider_badges_reflect_freshness_usage_and_errors() {
+        let strings = LanguageId::English.strings();
+        let group_for = |percent: f64, cached: bool| {
+            let usage = UsageData::from_windows(vec![UsageWindow::new(
+                percent,
+                None,
+                Some(FIVE_HOURS_SECONDS),
+            )]);
+            detail_provider_group(
+                tray_icon::TrayIconKind::Claude,
+                "Claude Code",
+                Some(&usage),
+                None,
+                cached,
+                strings,
+            )
+        };
+        let assert_badge = |group: &DetailProviderGroup, text: &str, tone: DetailBadgeTone| {
+            let badge = group.badge.as_ref().expect("provider badge");
+            assert_eq!(badge.text, text);
+            assert_eq!(badge.tone, tone);
+        };
+
+        assert_badge(&group_for(0.0, false), "Unused", DetailBadgeTone::Neutral);
+        // A rounded display of 0% is not the same as no usage.
+        assert_badge(&group_for(0.4, false), "Normal", DetailBadgeTone::Neutral);
+        assert_badge(&group_for(1.0, false), "Normal", DetailBadgeTone::Neutral);
+        assert_badge(&group_for(51.0, true), "Cached", DetailBadgeTone::Neutral);
+
+        let cached_warning = group_for(92.0, true);
+        assert_badge(&cached_warning, "Cached", DetailBadgeTone::Neutral);
+        assert!(cached_warning.rows[0].warn);
+
+        let near_limit = group_for(89.6, false);
+        assert_badge(&near_limit, "Near limit", DetailBadgeTone::Critical);
+
+        let usage =
+            UsageData::from_windows(vec![UsageWindow::new(92.0, None, Some(FIVE_HOURS_SECONDS))]);
+        for (error, expected, tone) in [
+            (
+                ProviderStatus::AuthRequired,
+                "Sign in required",
+                DetailBadgeTone::Critical,
+            ),
+            (
+                ProviderStatus::RateLimited,
+                "Rate limited",
+                DetailBadgeTone::Degraded,
+            ),
+            (
+                ProviderStatus::RequestFailed,
+                "Request failed",
+                DetailBadgeTone::Degraded,
+            ),
+        ] {
+            let group = detail_provider_group(
+                tray_icon::TrayIconKind::Claude,
+                "Claude Code",
+                Some(&usage),
+                Some(error),
+                true,
+                strings,
+            );
+            assert_badge(&group, expected, tone);
+        }
+
+        let empty = UsageData::default();
+        let loading = detail_provider_group(
+            tray_icon::TrayIconKind::Claude,
+            "Claude Code",
+            Some(&empty),
+            None,
+            false,
+            strings,
+        );
+        assert_badge(&loading, "Loading", DetailBadgeTone::Neutral);
+    }
+
+    #[test]
+    fn detail_rows_use_compact_labels_and_short_placeholder() {
+        let usage = UsageData::from_windows(vec![
+            UsageWindow::new(1.0, None, Some(30 * 60)),
+            UsageWindow::new(2.0, None, Some(365 * 24 * 60 * 60)),
+        ]);
+        let group = detail_provider_group(
+            tray_icon::TrayIconKind::Codex,
+            "Codex",
+            Some(&usage),
+            None,
+            false,
+            LanguageId::Korean.strings(),
+        );
+        assert_eq!(group.rows[0].window_label, "30m");
+        assert_eq!(group.rows[1].window_label, "365d");
+
+        let loading = detail_provider_group(
+            tray_icon::TrayIconKind::Codex,
+            "Codex",
+            None,
+            None,
+            false,
+            LanguageId::English.strings(),
+        );
+        assert_eq!(loading.rows[0].window_label, "--");
+    }
+
+    #[test]
+    fn detail_dynamic_columns_clamp_and_keep_the_name_gap() {
+        for dpi in [96, 120, 144, 192] {
+            let _dpi = DpiScope::new(dpi);
+            assert_eq!(detail_badge_width(0, DetailBadgeTone::Critical), sc(64));
+            assert_eq!(
+                detail_badge_width(sc(500), DetailBadgeTone::Critical),
+                sc(104)
+            );
+            let badge_width = detail_badge_width(sc(80), DetailBadgeTone::Critical);
+            let (badge_left, name_right) = detail_badge_horizontal_bounds(sc(378), badge_width);
+            assert_eq!(badge_left - name_right, sc(8));
+            assert!(name_right < badge_left);
+
+            assert_eq!(detail_percent_column_width(0), sc(42));
+            assert_eq!(detail_percent_column_width(sc(500)), sc(48));
+        }
+
+        let _dpi = DpiScope::new(96);
+        unsafe {
+            let hdc = GetDC(HWND::default());
+            let auth_width = measure_detail_text_width(
+                hdc,
+                "Sign in required",
+                "Segoe UI",
+                11,
+                FW_NORMAL.0 as i32,
+            );
+            let percent_width =
+                measure_detail_text_width(hdc, "100%", "Segoe UI", 16, FW_SEMIBOLD.0 as i32);
+            ReleaseDC(HWND::default(), hdc);
+
+            assert!(detail_badge_width(auth_width, DetailBadgeTone::Critical) > sc(64));
+            assert!(detail_percent_column_width(percent_width) >= percent_width);
+        }
+    }
+
+    #[test]
+    fn reference_card_height_and_popup_size_scale_as_one_layout() {
+        let row = DetailUsageRow {
+            window_label: "5h".to_string(),
+            percent: Some(42.0),
+            reset_text: "Resets in 2h".to_string(),
+            dividers: 5,
+            warn: false,
+        };
+        let group = DetailProviderGroup {
+            kind: tray_icon::TrayIconKind::Claude,
+            name: "Claude Code".to_string(),
+            badge: None,
+            rows: vec![row.clone(), row],
+        };
+        let snapshot = DetailPopupState {
+            title: "AI Usage Monitor".to_string(),
+            providers: vec![group.clone()],
+            status: "Updated now".to_string(),
+            version: "test".to_string(),
+        };
+
+        assert_eq!(detail_group_height(&group), 152);
+        let mut badged = group.clone();
+        badged.badge = Some(DetailBadge {
+            text: "Sign in required".to_string(),
+            tone: DetailBadgeTone::Critical,
+        });
+        assert_eq!(detail_group_height(&badged), 152);
+
+        for (dpi, expected) in [
+            (96, (408, 258)),
+            (120, (510, 323)),
+            (144, (612, 387)),
+            (192, (816, 516)),
+        ] {
+            let _dpi = DpiScope::new(dpi);
+            assert_eq!(detail_popup_size(&snapshot), expected);
+        }
+
+        let full_snapshot = DetailPopupState {
+            title: snapshot.title.clone(),
+            providers: vec![
+                group.clone(),
+                DetailProviderGroup {
+                    rows: vec![group.rows[0].clone()],
+                    ..group.clone()
+                },
+                group,
+            ],
+            status: snapshot.status,
+            version: snapshot.version,
+        };
+        let _dpi = DpiScope::new(120);
+        assert_eq!(detail_popup_size(&full_snapshot), (510, 668));
+    }
+
+    #[test]
+    fn detail_bar_cells_leave_gaps_only_between_segments() {
+        for dpi in [96, 144, 192] {
+            let _dpi = DpiScope::new(dpi);
+            let rect = RECT {
+                left: sc(13),
+                top: sc(4),
+                right: sc(213),
+                bottom: sc(16),
+            };
+
+            for cell_count in [5, 7] {
+                let cells: Vec<_> = (0..cell_count)
+                    .map(|index| detail_bar_cell_rect(&rect, cell_count, index))
+                    .collect();
+                assert_eq!(cells.first().unwrap().left, rect.left);
+                assert_eq!(cells.last().unwrap().right, rect.right);
+                assert!(cells.iter().all(|cell| {
+                    cell.top == rect.top && cell.bottom == rect.bottom && cell.right > cell.left
+                }));
+                assert!(cells
+                    .windows(2)
+                    .all(|pair| pair[1].left - pair[0].right == sc(DETAIL_BAR_GAP)));
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_provider_tiles_use_exact_png_and_hicon_sizes() {
+        for dpi in PROVIDER_TILE_BUCKET_DPIS {
+            let _dpi = DpiScope::new(dpi);
+            for kind in [
+                tray_icon::TrayIconKind::Claude,
+                tray_icon::TrayIconKind::Codex,
+                tray_icon::TrayIconKind::Antigravity,
+            ] {
+                for (tile_size, logical_size) in [
+                    (TileSize::Chip16, 16),
+                    (TileSize::Chip20, 20),
+                    (TileSize::Chip28, DETAIL_LOGO_CHIP_SIZE),
+                ] {
+                    let asset = provider_tile_asset(kind, dpi, false, tile_size);
+                    assert_eq!(asset.size, sc(logical_size));
+                    assert_eq!(
+                        png_ihdr(asset.bytes),
+                        (asset.size as u32, asset.size as u32, 8, 6)
+                    );
+
+                    let (hicon, size) = provider_tile_icon(kind, dpi, false, false, tile_size)
+                        .expect("provider tile");
+                    assert_eq!(size, asset.size);
+                    let (width, height, bits_per_pixel) = hicon_color_bitmap_metrics(hicon);
+                    assert_eq!((width, height), (size, size));
+                    assert_eq!(bits_per_pixel, 32);
+
+                    let dark_asset = provider_tile_asset(kind, dpi, true, tile_size);
+                    assert_eq!(
+                        png_ihdr(dark_asset.bytes),
+                        (dark_asset.size as u32, dark_asset.size as u32, 8, 6)
+                    );
+                    let (dark_hicon, dark_size) =
+                        provider_tile_icon(kind, dpi, true, false, tile_size)
+                            .expect("dark provider tile");
+                    assert_eq!(dark_size, dark_asset.size);
+                    let (dark_width, dark_height, dark_bits_per_pixel) =
+                        hicon_color_bitmap_metrics(dark_hicon);
+                    assert_eq!((dark_width, dark_height), (dark_size, dark_size));
+                    assert_eq!(dark_bits_per_pixel, 32);
+                    assert!(provider_tile_icon(kind, dpi, true, true, tile_size).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_tile_bucket_selection_clamps_and_breaks_ties_downward() {
+        for (index, dpi) in PROVIDER_TILE_BUCKET_DPIS.iter().enumerate() {
+            assert_eq!(nearest_provider_tile_bucket(*dpi), index);
+        }
+        for (dpi, bucket) in [
+            (0, 0),
+            (72, 0),
+            (108, 0),
+            (109, 1),
+            (132, 1),
+            (133, 2),
+            (156, 2),
+            (157, 3),
+            (180, 3),
+            (181, 4),
+            (240, 4),
+        ] {
+            assert_eq!(nearest_provider_tile_bucket(dpi), bucket, "dpi={dpi}");
+        }
+    }
+
+    #[test]
+    fn detail_duration_spacing_follows_the_writing_system() {
+        let duration = 3 * 60 * 60 + 38 * 60;
+        assert_eq!(
+            detail_duration_from_secs(duration, LanguageId::English.strings()),
+            "3h 38m"
+        );
+        assert_eq!(
+            detail_duration_from_secs(duration, LanguageId::SimplifiedChinese.strings()),
+            "3小时38分钟"
+        );
+        assert_eq!(detail_body_face("3小时38分钟后重置"), "Microsoft YaHei UI");
     }
 
     #[test]
@@ -7817,10 +10139,17 @@ mod reset_notification_tests {
         let first = detail_poll_timing_status(1_000, false, POLL_1_MIN, strings, 1_047);
         let second = detail_poll_timing_status(1_000, false, POLL_1_MIN, strings, 1_048);
 
-        assert!(first.contains("Updated 47s ago"));
+        assert!(first.contains("Every 1m"));
         assert!(first.contains("next in 13s"));
-        assert!(second.contains("Updated 48s ago"));
+        assert!(!first.contains("Updated"));
+        assert!(second.contains("Every 1m"));
         assert!(second.contains("next in 12s"));
+
+        let cached = detail_poll_timing_status(1_000, true, POLL_1_MIN, strings, 1_047);
+        assert!(cached.contains("Data from last run"));
+        assert!(cached.contains("Updated 47s ago"));
+        assert!(!cached.contains("Every"));
+        assert!(!cached.contains("next in"));
     }
 
     #[test]

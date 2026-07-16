@@ -18,7 +18,11 @@ use crate::models::{
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_USER_AGENT: &str = "claude-code/2.1.85";
-const CLAUDE_USAGE_MIN_POLL_MS: u64 = 180_000;
+const CLAUDE_USAGE_NORMAL_POLL_MS: u64 = 180_000;
+const CLAUDE_USAGE_FAST_POLL_MS: u64 = 120_000;
+const CLAUDE_USAGE_FAST_EXTRA: u32 = 2;
+const CLAUDE_RATE_LIMIT_MIN_RETRY_MS: u32 = 300_000;
+const CLAUDE_RATE_LIMIT_MAX_RETRY_MS: u32 = 3_600_000;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
@@ -64,9 +68,22 @@ struct CachedClaudeUsage {
     token_hash: u64,
     fetched_at: SystemTime,
     data: UsageData,
+    fast_polls_remaining: u32,
 }
 
-static CLAUDE_USAGE_CACHE: OnceLock<Mutex<Option<CachedClaudeUsage>>> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct ClaudeRateLimit {
+    token_hash: u64,
+    until: SystemTime,
+}
+
+#[derive(Default)]
+struct ClaudePollState {
+    cached: Option<CachedClaudeUsage>,
+    rate_limit: Option<ClaudeRateLimit>,
+}
+
+static CLAUDE_POLL_STATE: OnceLock<Mutex<ClaudePollState>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct CodexAuthFile {
@@ -189,12 +206,13 @@ pub fn poll(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    force_claude_refresh: bool,
 ) -> Result<AppUsageData, PollError> {
     poll_with(
         show_claude_code,
         show_codex,
         show_antigravity,
-        poll_claude_code,
+        || poll_claude_code(force_claude_refresh),
         poll_codex,
         poll_antigravity,
     )
@@ -284,8 +302,8 @@ fn record_poll_error(data: &mut AppUsageData, error: PollError) {
     }
 }
 
-fn claude_usage_cache() -> &'static Mutex<Option<CachedClaudeUsage>> {
-    CLAUDE_USAGE_CACHE.get_or_init(|| Mutex::new(None))
+fn claude_poll_state() -> &'static Mutex<ClaudePollState> {
+    CLAUDE_POLL_STATE.get_or_init(|| Mutex::new(ClaudePollState::default()))
 }
 
 fn token_hash(token: &str) -> u64 {
@@ -294,35 +312,138 @@ fn token_hash(token: &str) -> u64 {
     hasher.finish()
 }
 
-fn cached_claude_usage(token_hash: u64) -> Option<UsageData> {
-    let cache = claude_usage_cache().lock().ok()?;
-    let cached = cache.as_ref()?;
-    if cached.token_hash != token_hash {
+fn claude_poll_interval_ms(cached: &CachedClaudeUsage) -> u64 {
+    if cached.fast_polls_remaining > 0 {
+        CLAUDE_USAGE_FAST_POLL_MS
+    } else {
+        CLAUDE_USAGE_NORMAL_POLL_MS
+    }
+}
+
+fn claude_cache_is_fresh(
+    cached: &CachedClaudeUsage,
+    token_hash: u64,
+    force_refresh: bool,
+    now: SystemTime,
+) -> bool {
+    if force_refresh || cached.token_hash != token_hash {
+        return false;
+    }
+    let Ok(age) = now.duration_since(cached.fetched_at) else {
+        return false;
+    };
+    age < Duration::from_millis(claude_poll_interval_ms(cached))
+}
+
+fn cached_claude_usage(token_hash: u64, force_refresh: bool) -> Option<UsageData> {
+    let state = claude_poll_state().lock().ok()?;
+    let cached = state.cached.as_ref()?;
+    let now = SystemTime::now();
+    if !claude_cache_is_fresh(cached, token_hash, force_refresh, now) {
+        if force_refresh && cached.token_hash == token_hash {
+            diagnose::log("Claude usage manual refresh bypassed the normal cache cooldown");
+        }
         return None;
     }
-    let age = SystemTime::now()
-        .duration_since(cached.fetched_at)
-        .unwrap_or_default();
-    if age > Duration::from_millis(CLAUDE_USAGE_MIN_POLL_MS) {
-        return None;
-    }
+    let age = now.duration_since(cached.fetched_at).ok()?;
+    let interval_ms = claude_poll_interval_ms(cached);
     diagnose::log(format!(
-        "Claude usage poll skipped; using cached usage data age={}s",
-        age.as_secs()
+        "Claude usage poll skipped; using cached usage data age={}s cadence={}s",
+        age.as_secs(),
+        interval_ms / 1000
     ));
     Some(cached.data.clone())
 }
 
+fn claude_usage_increased(previous: &UsageData, current: &UsageData) -> bool {
+    current.windows.iter().any(|current_window| {
+        previous.windows.iter().any(|previous_window| {
+            previous_window.duration_seconds == current_window.duration_seconds
+                && previous_window.source_label == current_window.source_label
+                && current_window.percentage > previous_window.percentage
+        })
+    })
+}
+
+fn next_claude_fast_polls(
+    cached: Option<&CachedClaudeUsage>,
+    token_hash: u64,
+    data: &UsageData,
+) -> u32 {
+    cached
+        .filter(|cached| cached.token_hash == token_hash)
+        .map_or(0, |cached| {
+            if claude_usage_increased(&cached.data, data) {
+                CLAUDE_USAGE_FAST_EXTRA + 1
+            } else {
+                cached.fast_polls_remaining.saturating_sub(1)
+            }
+        })
+}
+
 fn store_cached_claude_usage(token_hash: u64, data: &UsageData) {
-    if let Ok(mut cache) = claude_usage_cache().lock() {
-        *cache = Some(CachedClaudeUsage {
+    if let Ok(mut state) = claude_poll_state().lock() {
+        let fast_polls_remaining = next_claude_fast_polls(state.cached.as_ref(), token_hash, data);
+        let interval_ms = if fast_polls_remaining > 0 {
+            CLAUDE_USAGE_FAST_POLL_MS
+        } else {
+            CLAUDE_USAGE_NORMAL_POLL_MS
+        };
+        diagnose::log(format!(
+            "Claude usage poll succeeded; next cadence={}s fast_polls_remaining={fast_polls_remaining}",
+            interval_ms / 1000
+        ));
+        state.cached = Some(CachedClaudeUsage {
             token_hash,
             fetched_at: SystemTime::now(),
             data: data.clone(),
+            fast_polls_remaining,
         });
+        state.rate_limit = None;
     }
 }
-fn poll_claude_code() -> Result<UsageData, PollError> {
+
+fn claude_rate_limit_delay_ms(retry_after_ms: Option<u32>) -> u32 {
+    retry_after_ms
+        .unwrap_or(CLAUDE_RATE_LIMIT_MIN_RETRY_MS)
+        .clamp(
+            CLAUDE_RATE_LIMIT_MIN_RETRY_MS,
+            CLAUDE_RATE_LIMIT_MAX_RETRY_MS,
+        )
+}
+
+fn store_claude_rate_limit(token_hash: u64, retry_after_ms: Option<u32>) -> u32 {
+    let delay_ms = claude_rate_limit_delay_ms(retry_after_ms);
+    if let Ok(mut state) = claude_poll_state().lock() {
+        state.rate_limit = Some(ClaudeRateLimit {
+            token_hash,
+            until: SystemTime::now()
+                .checked_add(Duration::from_millis(delay_ms as u64))
+                .unwrap_or_else(SystemTime::now),
+        });
+    }
+    delay_ms
+}
+
+fn claude_rate_limit_remaining_ms(token_hash: u64) -> Option<u32> {
+    let mut state = claude_poll_state().lock().ok()?;
+    let rate_limit = state.rate_limit?;
+    if rate_limit.token_hash != token_hash {
+        state.rate_limit = None;
+        return None;
+    }
+    match rate_limit.until.duration_since(SystemTime::now()) {
+        Ok(remaining) if !remaining.is_zero() => {
+            Some(remaining.as_millis().clamp(1, u32::MAX as u128) as u32)
+        }
+        _ => {
+            state.rate_limit = None;
+            None
+        }
+    }
+}
+
+fn poll_claude_code(force_refresh: bool) -> Result<UsageData, PollError> {
     let creds = match read_first_credentials() {
         Some(c) => c,
         None => {
@@ -333,13 +454,28 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
 
     let creds = refresh_or_fallback(creds)?;
     let token_hash = token_hash(&creds.access_token);
-    if let Some(cached) = cached_claude_usage(token_hash) {
+    if let Some(remaining_ms) = claude_rate_limit_remaining_ms(token_hash) {
+        diagnose::log(format!(
+            "Claude usage poll skipped; rate-limit backoff remaining={}s",
+            remaining_ms.div_ceil(1000)
+        ));
+        return Err(PollError::RateLimited(Some(remaining_ms)));
+    }
+    if let Some(cached) = cached_claude_usage(token_hash, force_refresh) {
         return Ok(cached);
     }
 
-    let data = fetch_usage_with_fallback(&creds.access_token)?;
-    store_cached_claude_usage(token_hash, &data);
-    Ok(data)
+    match fetch_usage_with_fallback(&creds.access_token) {
+        Ok(data) => {
+            store_cached_claude_usage(token_hash, &data);
+            Ok(data)
+        }
+        Err(PollError::RateLimited(retry_after_ms)) => {
+            let delay_ms = store_claude_rate_limit(token_hash, retry_after_ms);
+            Err(PollError::RateLimited(Some(delay_ms)))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn poll_codex() -> Result<UsageData, PollError> {
@@ -1505,22 +1641,22 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Format a usage section as "X% · Yh" style text for compact surfaces.
+/// Format a usage section as "X%·Yh" style text for compact surfaces.
 /// These units deliberately stay English (d/h/m/s/now) in every UI
 /// language: they are terse, universally recognizable, and keep the taskbar
-/// widget and floating window geometrically stable. The detail popup remains
-/// fully localized.
-pub fn format_line(section: &UsageWindow) -> String {
+/// and floating surfaces compact.
+#[cfg(test)]
+fn format_line(section: &UsageWindow) -> String {
     let pct = format!("{:.0}%", section.percentage);
     let cd = format_countdown(section.resets_at);
     if cd.is_empty() {
         pct
     } else {
-        format!("{pct} \u{00b7} {cd}")
+        format!("{pct}\u{00b7}{cd}")
     }
 }
 
-fn format_countdown(resets_at: Option<SystemTime>) -> String {
+pub(crate) fn format_countdown(resets_at: Option<SystemTime>) -> String {
     let reset = match resets_at {
         Some(t) => t,
         None => return String::new(),
@@ -1607,7 +1743,7 @@ mod tests {
             Some(FIVE_HOURS_SECONDS),
         );
 
-        assert_eq!(format_line(&usage), "85% · now");
+        assert_eq!(format_line(&usage), "85%·now");
     }
 
     #[test]
@@ -1680,6 +1816,86 @@ mod tests {
             None,
             Some(FIVE_HOURS_SECONDS),
         )])
+    }
+
+    fn cached_claude_usage_for_test(
+        percentage: f64,
+        fetched_at: SystemTime,
+        fast_polls_remaining: u32,
+    ) -> CachedClaudeUsage {
+        CachedClaudeUsage {
+            token_hash: 7,
+            fetched_at,
+            data: usage_with_percent(percentage),
+            fast_polls_remaining,
+        }
+    }
+
+    #[test]
+    fn claude_cache_uses_completion_based_normal_and_fast_deadlines() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let normal_fresh = cached_claude_usage_for_test(
+            10.0,
+            now.checked_sub(Duration::from_secs(179)).unwrap(),
+            0,
+        );
+        let normal_due = cached_claude_usage_for_test(
+            10.0,
+            now.checked_sub(Duration::from_secs(180)).unwrap(),
+            0,
+        );
+        let fast_fresh = cached_claude_usage_for_test(
+            10.0,
+            now.checked_sub(Duration::from_secs(119)).unwrap(),
+            1,
+        );
+        let fast_due = cached_claude_usage_for_test(
+            10.0,
+            now.checked_sub(Duration::from_secs(120)).unwrap(),
+            1,
+        );
+
+        assert!(claude_cache_is_fresh(&normal_fresh, 7, false, now));
+        assert!(!claude_cache_is_fresh(&normal_due, 7, false, now));
+        assert!(claude_cache_is_fresh(&fast_fresh, 7, false, now));
+        assert!(!claude_cache_is_fresh(&fast_due, 7, false, now));
+        assert!(!claude_cache_is_fresh(&normal_fresh, 7, true, now));
+    }
+
+    #[test]
+    fn claude_usage_growth_arms_three_fast_follow_up_polls() {
+        let previous = cached_claude_usage_for_test(10.0, SystemTime::now(), 0);
+        let increased = usage_with_percent(11.0);
+        assert_eq!(
+            next_claude_fast_polls(Some(&previous), 7, &increased),
+            CLAUDE_USAGE_FAST_EXTRA + 1
+        );
+
+        let fast = cached_claude_usage_for_test(11.0, SystemTime::now(), 3);
+        assert_eq!(
+            next_claude_fast_polls(Some(&fast), 7, &usage_with_percent(11.0)),
+            2
+        );
+        assert_eq!(
+            next_claude_fast_polls(Some(&fast), 8, &usage_with_percent(12.0)),
+            0
+        );
+    }
+
+    #[test]
+    fn claude_rate_limit_delay_keeps_manual_refresh_inside_backoff() {
+        assert_eq!(
+            claude_rate_limit_delay_ms(None),
+            CLAUDE_RATE_LIMIT_MIN_RETRY_MS
+        );
+        assert_eq!(
+            claude_rate_limit_delay_ms(Some(1_000)),
+            CLAUDE_RATE_LIMIT_MIN_RETRY_MS
+        );
+        assert_eq!(
+            claude_rate_limit_delay_ms(Some(u32::MAX)),
+            CLAUDE_RATE_LIMIT_MAX_RETRY_MS
+        );
     }
 
     #[test]

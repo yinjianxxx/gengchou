@@ -36,7 +36,7 @@ function Start-HiddenProcess {
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
 
-    if ($null -ne $startInfo.PSObject.Properties['ArgumentList']) {
+    if ($startInfo.PSObject.Properties.Name -contains 'ArgumentList') {
         foreach ($argument in $ArgumentList) {
             $startInfo.ArgumentList.Add($argument)
         }
@@ -48,14 +48,35 @@ function Start-HiddenProcess {
         ) -join ' '
     }
 
-    foreach ($name in $Environment.Keys) {
-        $startInfo.EnvironmentVariables[$name] = [string]$Environment[$name]
-    }
-
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
-        throw "Unable to start process: $FilePath"
+
+    # Windows PowerShell 5.1 can fail while materializing ProcessStartInfo's
+    # environment dictionary when the host process contains case-variant keys
+    # such as PATH and Path. Set only the fixture overrides around Start(), so
+    # the child inherits them without enumerating or rewriting the full block.
+    $previousEnvironment = @{}
+    foreach ($name in $Environment.Keys) {
+        $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            [string]$Environment[$name],
+            'Process'
+        )
+    }
+    try {
+        if (-not $process.Start()) {
+            throw "Unable to start process: $FilePath"
+        }
+    }
+    finally {
+        foreach ($name in $previousEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable(
+                $name,
+                $previousEnvironment[$name],
+                'Process'
+            )
+        }
     }
     return $process
 }
