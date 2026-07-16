@@ -46,13 +46,27 @@ fn main() {
     }
 
     // Diagnostic: render the detail popup with representative data to a BMP
-    // and exit. Used to eyeball popup layout changes.
+    // and exit. Used to eyeball popup layout changes and to render README
+    // previews. Optional tokens after the directory select the fixture
+    // language (`en`/`zh`, default `zh`) and force a theme (`dark`/`light`,
+    // default: follow the system theme).
     if let Some(pos) = args.iter().position(|arg| arg == "--dump-detail-popup") {
         let dir = args
             .get(pos + 1)
             .cloned()
             .unwrap_or_else(|| ".".to_string());
-        std::process::exit(window::dump_detail_popup(&dir));
+        let mut english = false;
+        let mut force_dark = None;
+        for token in args.iter().skip(pos + 2) {
+            match token.to_ascii_lowercase().as_str() {
+                "en" => english = true,
+                "zh" | "zh-cn" => english = false,
+                "dark" => force_dark = Some(true),
+                "light" => force_dark = Some(false),
+                _ => break,
+            }
+        }
+        std::process::exit(window::dump_detail_popup(&dir, english, force_dark));
     }
 
     // Diagnostic: render both compact surfaces with representative data and

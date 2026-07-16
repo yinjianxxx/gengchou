@@ -3263,7 +3263,7 @@ fn dump_widget_tooltip_bmp(
 /// `tray_icon::dump_icons`; lets popup layout changes be eyeballed without
 /// hunting for the live tray popup. Renders at 125%, matching the target
 /// desktop used for final visual review.
-pub fn dump_detail_popup(dir: &str) -> i32 {
+pub fn dump_detail_popup(dir: &str, english: bool, force_dark: Option<bool>) -> i32 {
     ACTIVE_WINDOW_DPI.with(|dpi| dpi.set(120));
 
     let row = |label: &str, percent: f64, reset: &str, dividers: i32| DetailUsageRow {
@@ -3273,6 +3273,42 @@ pub fn dump_detail_popup(dir: &str) -> i32 {
         dividers,
         warn: compact_view::display_percent(percent) >= compact_view::WARN_THRESHOLD_PERCENT,
     };
+    // Two parallel fixture string sets mirroring the live UI formats
+    // (`detail_resets_in`, `detail_poll_every` · `detail_next_in`, badge
+    // strings) so README previews match what each language actually shows.
+    struct FixtureStrings {
+        near_limit: &'static str,
+        normal: &'static str,
+        resets: [&'static str; 5],
+        status: &'static str,
+    }
+    let fixture = if english {
+        FixtureStrings {
+            near_limit: "Near limit",
+            normal: "Normal",
+            resets: [
+                "Resets in 3h 5m · 01:00",
+                "Resets in 5h 5m · 03:00",
+                "Resets in 5d 9h · 07:00",
+                "Resets in 5h · 02:55",
+                "Resets in 3d 3h · 01:51",
+            ],
+            status: "Every 1m · next in 44s",
+        }
+    } else {
+        FixtureStrings {
+            near_limit: "接近上限",
+            normal: "正常",
+            resets: [
+                "3小时5分钟后重置 · 01:00",
+                "5小时5分钟后重置 · 03:00",
+                "5天9小时后重置 · 07:00",
+                "5小时后重置 · 02:55",
+                "3天3小时后重置 · 01:51",
+            ],
+            status: "每 1分钟 · 44秒后刷新",
+        }
+    };
     let snapshot = DetailPopupState {
         title: "Gengchou".to_string(),
         providers: vec![
@@ -3280,39 +3316,44 @@ pub fn dump_detail_popup(dir: &str) -> i32 {
                 kind: tray_icon::TrayIconKind::Claude,
                 name: "Claude Code".to_string(),
                 badge: Some(DetailBadge {
-                    text: "接近上限".to_string(),
+                    text: fixture.near_limit.to_string(),
                     tone: DetailBadgeTone::Critical,
                 }),
                 rows: vec![
-                    row("5h", 8.0, "3小时5分钟后重置 · 01:00", 5),
-                    row("7d", 92.0, "5小时5分钟后重置 · 03:00", 7),
+                    row("5h", 8.0, fixture.resets[0], 5),
+                    row("7d", 92.0, fixture.resets[1], 7),
                 ],
             },
             DetailProviderGroup {
                 kind: tray_icon::TrayIconKind::Codex,
                 name: "Codex".to_string(),
                 badge: Some(DetailBadge {
-                    text: "正常".to_string(),
+                    text: fixture.normal.to_string(),
                     tone: DetailBadgeTone::Neutral,
                 }),
-                rows: vec![row("7d", 51.0, "5天9小时后重置 · 07:00", 7)],
+                rows: vec![row("7d", 51.0, fixture.resets[2], 7)],
             },
             DetailProviderGroup {
                 kind: tray_icon::TrayIconKind::Antigravity,
                 name: "Antigravity".to_string(),
                 badge: Some(DetailBadge {
-                    text: "正常".to_string(),
+                    text: fixture.normal.to_string(),
                     tone: DetailBadgeTone::Neutral,
                 }),
                 rows: vec![
-                    row("5h", 0.0, "5小时后重置 · 02:55", 5),
-                    row("7d", 1.0, "3天3小时后重置 · 01:51", 7),
+                    row("5h", 0.0, fixture.resets[3], 5),
+                    row("7d", 1.0, fixture.resets[4], 7),
                 ],
             },
         ],
-        status: "每 1分钟 · 44秒后刷新".to_string(),
+        status: fixture.status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
+
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        diagnose::log_error("dump detail popup: create directory failed", error);
+        return 1;
+    }
 
     let (width, height) = detail_popup_size(&snapshot);
     unsafe {
@@ -3339,7 +3380,13 @@ pub fn dump_detail_popup(dir: &str) -> i32 {
             return 1;
         }
         let old_bmp = SelectObject(mem_dc, dib);
-        paint_detail_content(mem_dc, width, height, &snapshot);
+        let is_dark = force_dark.unwrap_or_else(theme::is_dark_mode);
+        let high_contrast = if force_dark.is_some() {
+            false
+        } else {
+            theme::is_high_contrast()
+        };
+        paint_detail_content(mem_dc, width, height, &snapshot, is_dark, high_contrast);
         let _ = windows::Win32::Graphics::Gdi::GdiFlush();
 
         let byte_count = (width * height * 4) as usize;
@@ -4225,7 +4272,14 @@ fn paint_detail_popup(hdc: HDC, hwnd: HWND) {
         let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
         let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-        paint_detail_content(mem_dc, width, height, &snapshot);
+        paint_detail_content(
+            mem_dc,
+            width,
+            height,
+            &snapshot,
+            theme::is_dark_mode(),
+            theme::is_high_contrast(),
+        );
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
 
         SelectObject(mem_dc, old_bmp);
@@ -4343,9 +4397,14 @@ fn provider_chip_style(
     }
 }
 
-fn paint_detail_content(hdc: HDC, width: i32, height: i32, snapshot: &DetailPopupState) {
-    let is_dark = theme::is_dark_mode();
-    let high_contrast = theme::is_high_contrast();
+fn paint_detail_content(
+    hdc: HDC,
+    width: i32,
+    height: i32,
+    snapshot: &DetailPopupState,
+    is_dark: bool,
+    high_contrast: bool,
+) {
     let palette = detail_palette(is_dark, high_contrast);
 
     unsafe {
