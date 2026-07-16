@@ -28,6 +28,15 @@ Codex, and Antigravity each get a live percentage on whichever surface you
 prefer, from a full detail card down to a single tray number, so checking
 your remaining budget never means opening a dashboard.
 
+> 烧香知夜漏，刻烛验更筹。
+>
+> — Yu Jianwu, 《奉和春夜应令》, Southern Liang
+
+The name *Gengchou* (更筹) comes from the tally sticks used to mark the watches
+of the night; by extension, the term can also refer to time itself. These
+tally sticks made the passing hours visible; the app does the same for quota
+usage and reset cycles.
+
 Formerly **AI Usage Monitor**: the rename changed the product's name, not
 your data — settings, cache, and the update path all carry over. Originally
 derived from
