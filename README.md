@@ -80,10 +80,10 @@ Release maintainers should also follow the [release checklist](docs/RELEASE_CHEC
 - Icons enabled by default: one compact usage icon per provider, with an
   optional single app-icon mode
 - Theme-aware detail popup with per-provider status, exact reset times, a
-  live-updating refresh countdown, and an optional temporary move unlock
+  live-updating refresh countdown, and a temporary position lock
 - Optional long-lived floating copy of the compact widget, draggable from its
-  whole surface, position-aware across restarts, lockable, and resettable to
-  the primary work area's bottom-right corner
+  whole surface, position-aware across restarts, and resettable to the primary
+  work area's bottom-right corner
 - Windows system colours in High Contrast mode
 - Optional reset notifications (off by default)
 - Survives `explorer.exe` restarts and RDP / lock-screen transitions
@@ -99,8 +99,8 @@ Release maintainers should also follow the [release checklist](docs/RELEASE_CHEC
   place for the current opening; closing it restores automatic placement and
   movable mode next time.
 - **Right-click** a widget or tray icon, then click **Icons**, **Widget**, or
-  **Floating Window** directly to toggle it. Position resets, floating-window
-  lock, notifications, and start-with-Windows are under **Settings**.
+  **Floating Window** directly to toggle it. Position resets, notifications,
+  and start-with-Windows are under **Settings**.
 - Open **Refresh** to refresh immediately with **Now** or select the automatic
   polling interval.
 
@@ -108,19 +108,26 @@ Release maintainers should also follow the [release checklist](docs/RELEASE_CHEC
 
 <img src=".github/taskbar-widget.png" alt="AI Usage Monitor widget embedded in a Windows taskbar">
 
-The widget embeds directly in the taskbar. Drag it by its left divider to
-reposition it; drop it on another taskbar to change monitors. If Explorer is
-temporarily unavailable the widget remains hidden instead of appearing on the
-desktop, then re-embeds when the taskbar returns.
+The widget embeds directly in the taskbar. Each provider gets a content-sized,
+single-line badge with its logo, quota-window label, and short-window usage.
+If any other window reaches 90%, that warning window takes over, the badge
+turns red, and its countdown appears. Hover a badge to inspect every reported
+quota window and reset time. Drag the left
+divider to reposition it or drop it on another taskbar to change monitors. If
+Explorer is temporarily unavailable the widget remains hidden instead of
+appearing on the desktop, then re-embeds when the taskbar returns.
 
 ### Floating window
 
-The optional floating window is a separate long-lived copy of the compact
-widget, not an automatic fallback for the taskbar widget. While position lock
-is off, drag anywhere on its surface; a short click still opens the detail
-popup. It omits the taskbar-only drag divider and stays above normal windows.
-Its position is remembered across restarts, and **Settings** can lock it or
-restore its default at the bottom-right of the primary work area.
+The optional floating window is a separate long-lived numeric view, not an
+automatic fallback or a stretched copy of the taskbar widget. It keeps up to
+two highest-usage quota windows visible beside each provider logo, with each
+label, percentage, and countdown aligned above its micro gauge. Drag anywhere
+on its surface; a short click still opens the detail popup. It stays above
+normal windows, remembers its position across restarts, remains inside the
+active work area with an 8-logical-pixel safety margin, and can be reset from
+**Settings**. Pairing these two distinct views with the single neutral app-icon
+mode avoids repeating the same number in the tray.
 
 ### Tray icons
 

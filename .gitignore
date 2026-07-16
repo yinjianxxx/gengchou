@@ -33,6 +33,7 @@ AGENTS.md
 # Local packaging and runtime verification
 /output/
 /runtime_verify/
+/tmp/
 
 # Local agent configuration
 /.agents/

@@ -11,6 +11,9 @@ with a short note in the release runbook.
 - `cargo test --locked`
 - updater helper E2E: `Success` and `ChildExit`
 - `cargo build --release --locked`
+- Debug compact-surface gate: `cargo run --locked -- --dump-widget
+  tmp/compact-release-check`; inspect every generated theme, warning/error,
+  High Contrast, tooltip, and mixed-digit alignment fixture.
 
 ## Manual Windows smoke test
 
@@ -34,17 +37,19 @@ with a short note in the release runbook.
   as a desktop popup, then re-embed from cached state as soon as the taskbar
   returns.
 - Confirm Icons, Widget, and Floating Window appear in that order before
-  Settings as direct checked toggles. Confirm both position resets and Floating
-  Window Position Lock remain under Settings.
+  Settings as direct checked toggles. Confirm the taskbar and floating-window
+  position resets remain under Settings and no floating-window lock item is
+  present.
 - Hide/show the taskbar widget and restore its default position; confirm it
   returns next to the notification area on the primary taskbar.
 - Show the floating window, drag it from several points across the whole
   compact surface, restart the app and confirm the position is remembered,
-  lock it and confirm it no longer moves, then restore it to the primary work
-  area's bottom-right. Confirm a short click still opens details and it never
-  appears automatically as a taskbar fallback. Confirm the taskbar-only left
-  divider is absent and the floating window remains above normal windows after
-  dragging, changing display configuration, and restoring a remote session.
+  then restore it to the primary work area's bottom-right. Confirm it remains
+  draggable after reopening, a short click still opens details, and it never
+  appears automatically as a taskbar fallback. At every work-area edge verify
+  an 8-logical-pixel safety margin. Confirm the taskbar-only left divider is
+  absent and the floating window remains above normal windows after dragging,
+  changing display configuration, and restoring a remote session.
 - Switch the UI through at least English, Simplified Chinese, and one other
   language; confirm taskbar and floating duration labels and countdowns still
   use only `d`/`h`/`m`/`s`/`now`, while detail-popup prose remains localized.
@@ -60,7 +65,11 @@ with a short note in the release runbook.
 - Hover each provider icon and confirm its title and quota windows use separate
   lines with reset timing in parentheses. Disable Icons and confirm the app
   icon uses one compact line per provider without mid-line truncation.
-- Exercise 100%, 125%, 150%, and 200% DPI where available. On mixed-DPI
+- Hover each taskbar badge and confirm the custom theme-aware hover card appears
+  after the delay, lists every reported window with reset timing, stays within
+  the work area, and disappears on pointer leave, click, display change, or
+  Explorer rebuild.
+- Exercise 100%, 125%, 150%, 175%, and 200% DPI where available. On mixed-DPI
   monitors, move the detail and floating windows across monitor boundaries and
   confirm their suggested position, size, hit targets, and remembered floating
   position remain correct while the taskbar widget keeps its own scale.
@@ -71,8 +80,13 @@ with a short note in the release runbook.
   During the display transition, confirm a still-valid embedded widget is not
   detached merely because Windows briefly enumerates only one taskbar, and
   confirm tray and floating-window context menus remain responsive.
-- Enable Windows High Contrast and confirm widget, tray icons, popup, compact
-  floating window, tracks, and focus cues remain legible.
+- Test both a dark and a light Windows High Contrast theme. Confirm widget,
+  tray icons, popup, compact floating window, tracks, and focus cues remain
+  legible; warning row text must remain visible on the window canvas and every
+  character inside warning/error pills must contrast with the highlight fill.
+- Retake `.github/screenshot.png`, `.github/taskbar-widget.png`, and
+  `.github/tray-icons.png` from the final v2.1.0 build; verify the README text,
+  alt text, provider marks, compact layout, and displayed version match.
 - With Codex Desktop signed in and the CLI absent or unavailable, confirm Codex
   usage still loads from a supported local session.
 
