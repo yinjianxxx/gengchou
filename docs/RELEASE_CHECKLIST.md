@@ -87,9 +87,10 @@ with a short note in the release runbook.
   tray icons, popup, compact floating window, tracks, and focus cues remain
   legible; warning row text must remain visible on the window canvas and every
   character inside warning/error pills must contrast with the highlight fill.
-- Retake `.github/screenshot.png`, `.github/taskbar-widget.png`, and
-  `.github/tray-icons.png` from the final Gengchou build; verify the README text,
-  alt text, provider marks, compact layout, and displayed version match.
+- Re-render the README previews from the final build with
+  `tools\render-readme-images.ps1` and commit any changed `.github/readme/*.png`;
+  verify the README text, alt text, provider marks, compact layout, and the
+  version shown in the detail-popup images match the release.
 - With Codex Desktop signed in and the CLI absent or unavailable, confirm Codex
   usage still loads from a supported local session.
 

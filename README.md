@@ -1,6 +1,7 @@
 **English** | [简体中文](README.zh-CN.md)
 
 <!-- Keep user-facing behavior, installation, privacy, and release status aligned with README.zh-CN.md. -->
+<!-- Every preview image is rendered by the app itself; regenerate with tools\render-readme-images.ps1. -->
 
 <div align="center">
 
@@ -15,26 +16,72 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/gengchou)](https://github.com/yinjianxxx/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/screenshot.png" alt="Detail popup showing Claude Code, Codex, and Antigravity usage with reset times" width="480">
+<img src=".github/readme/detail-popup-en.png" alt="Detail popup: Claude Code flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="440">
 
-<sub>The detail popup — captured on Windows 11, dark theme.</sub>
+<sub>The detail popup — including what a near-limit warning looks like.</sub>
 
 </div>
 
-Gengchou is a lightweight native Windows app that puts your current
-provider-reported quota windows in a taskbar widget and compact tray icons, so
-checking your quota never means opening a dashboard. Formerly AI Usage Monitor,
-it keeps the same settings and update path across the rename. Originally derived from
+Gengchou puts the quota windows your AI providers actually report — how much
+is used, and when it resets — directly on the Windows taskbar. Claude Code,
+Codex, and Antigravity each get a live percentage on whichever surface you
+prefer, from a full detail card down to a single tray number, so checking
+your remaining budget never means opening a dashboard.
+
+Formerly **AI Usage Monitor**: the rename changed the product's name, not
+your data — settings, cache, and the update path all carry over. Originally
+derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
 it is now developed independently ([provenance](PROVENANCE.md)).
+
+## Surfaces at a glance
+
+|  | Dark | Light |
+| ---: | :--- | :--- |
+| **Taskbar widget** | <img src=".github/readme/widget-badges-dark.png" alt="Taskbar widget, dark theme: one badge per provider with logo, window label, and usage percentage"> | <img src=".github/readme/widget-badges-light.png" alt="Taskbar widget, light theme"> |
+| **Floating window** | <img src=".github/readme/floating-rows-dark.png" alt="Floating window, dark theme: up to two quota windows per provider with percentages, countdowns, and micro gauges"> | <img src=".github/readme/floating-rows-light.png" alt="Floating window, light theme"> |
+| **Tray icons** | <img src=".github/readme/tray-icons-dark.png" alt="Tray icons, dark theme: per-provider usage numbers over adaptive bars"> | <img src=".github/readme/tray-icons-light.png" alt="Tray icons, light theme"> |
+
+These previews are not screenshots: the app rendered them through its own
+`--dump-widget`, `--dump-tray-icons`, and `--dump-detail-popup` modes, so they
+show the exact pixels the shipped code draws. Regenerate them any time with
+[`tools/render-readme-images.ps1`](tools/render-readme-images.ps1).
+
+- **Taskbar widget.** Embeds in the taskbar itself: one content-sized badge
+  per provider showing its logo, quota-window label, and short-window usage.
+  Hover a badge to see every reported window with reset times. Drag the left
+  divider to reposition it, or drop it on another taskbar to change monitors.
+  If Explorer is temporarily gone, the widget hides and re-embeds rather than
+  landing on the desktop.
+- **Floating window.** A separate always-on-top numeric view, not a stretched
+  copy of the widget: up to the two highest-usage windows per provider, each
+  label, percentage, and countdown aligned above its micro gauge. Drag it from
+  anywhere on its surface; a short click still opens the detail popup. It
+  remembers its position, keeps an 8-pixel margin inside the work area, and
+  can be reset from **Settings**.
+- **Tray icons.** One live icon per enabled provider — the number and adaptive
+  bars follow whatever quota windows that provider reports; with no data the
+  number gives way to the provider's initial. Disable **Icons** to keep a
+  single neutral app icon instead.
+- **Detail popup.** Opens from a left-click on any surface: per-provider
+  status badges, exact reset clock times, a live refresh countdown, and a
+  temporary position lock for the current opening.
+
+When any quota window reaches 90%, it takes over that provider's badge, turns
+it red, and shows its own reset countdown — the warning finds you, not the
+other way around:
+
+<div align="center">
+<img src=".github/readme/widget-badges-warn-dark.png" alt="Taskbar widget in warning state: Claude Code's 7-day window at 92% has taken over the badge in red with its reset countdown">
+</div>
 
 ## Install
 
 Installation options, in recommended order:
 
-1. **WinGet (preferred when available).** Gengchou uses a new package identity;
-   the former AI Usage Monitor package was never published to WinGet. Once the
-   new package is available, install it with:
+1. **WinGet (preferred when available).** Gengchou uses a new package
+   identity; the former AI Usage Monitor package was never published to
+   WinGet. Once the new package is available, install it with:
 
    ```powershell
    winget install --id yinjianxxx.Gengchou --exact
@@ -45,13 +92,12 @@ Installation options, in recommended order:
 2. **Portable ZIP (recommended manual download).** Download
    `gengchou-windows-x64.zip` from the
    [latest release](https://github.com/yinjianxxx/gengchou/releases/latest),
-   extract it to any folder you can write to, and run
-   `gengchou.exe`. The bundle includes both READMEs and the retained
-   license and attribution notices.
+   extract it to any folder you can write to, and run `gengchou.exe`. The
+   bundle includes both READMEs and the retained license and attribution
+   notices.
 
-3. **Standalone EXE.** For a single-file download, get
-   `gengchou.exe` from the same release and run it from any writable
-   folder.
+3. **Standalone EXE.** For a single-file download, get `gengchou.exe` from
+   the same release and run it from any writable folder.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
 download verification, and self-updates check it automatically. Starting with
@@ -73,75 +119,31 @@ cargo build --release --locked
 
 </details>
 
-Release maintainers should also follow the [release checklist](docs/RELEASE_CHECKLIST.md).
+Release maintainers should also follow the
+[release checklist](docs/RELEASE_CHECKLIST.md).
 
-## Features
-
-- Live provider-reported quota windows with reset countdowns
-- Claude Code, Codex, and Google Antigravity — enable any combination
-- Icons enabled by default: one compact usage icon per provider, with an
-  optional single app-icon mode
-- Theme-aware detail popup with per-provider status, exact reset times, a
-  live-updating refresh countdown, and a temporary position lock
-- Optional long-lived floating copy of the compact widget, draggable from its
-  whole surface, position-aware across restarts, and resettable to the primary
-  work area's bottom-right corner
-- Windows system colours in High Contrast mode
-- Optional reset notifications (off by default)
-- Survives `explorer.exe` restarts and RDP / lock-screen transitions
-- Keeps provider polling on its configured cadence while Windows is locked or
-  RDP is disconnected; restoration only rebuilds local UI surfaces
-- Multi-monitor and multi-taskbar aware
-- 11 languages · no telemetry · a single ~1 MB portable executable
-
-## Usage
+## Controls
 
 - **Left-click** the widget or a tray icon to open or close the detail popup.
-- The detail popup is movable by default. Use its lock button to fix it in
-  place for the current opening; closing it restores automatic placement and
-  movable mode next time.
-- **Right-click** a widget or tray icon, then click **Icons**, **Widget**, or
-  **Floating Window** directly to toggle it. Position resets, notifications,
-  and start-with-Windows are under **Settings**.
-- Open **Refresh** to refresh immediately with **Now** or select the automatic
-  polling interval.
+- The popup is movable by default; its lock button pins it for the current
+  opening, and closing it restores automatic placement.
+- **Right-click** any surface, then click **Icons**, **Widget**, or
+  **Floating Window** directly to toggle that surface. Position resets,
+  notifications, and start-with-Windows live under **Settings**.
+- **Refresh** polls immediately with **Now** or sets the automatic interval.
 
-### Taskbar widget
+## Beyond the surfaces
 
-<img src=".github/taskbar-widget.png" alt="Gengchou widget embedded in a Windows taskbar">
-
-The widget embeds directly in the taskbar. Each provider gets a content-sized,
-single-line badge with its logo, quota-window label, and short-window usage.
-If any other window reaches 90%, that warning window takes over, the badge
-turns red, and its countdown appears. Hover a badge to inspect every reported
-quota window and reset time. Drag the left
-divider to reposition it or drop it on another taskbar to change monitors. If
-Explorer is temporarily unavailable the widget remains hidden instead of
-appearing on the desktop, then re-embeds when the taskbar returns.
-
-### Floating window
-
-The optional floating window is a separate long-lived numeric view, not an
-automatic fallback or a stretched copy of the taskbar widget. It keeps up to
-two highest-usage quota windows visible beside each provider logo, with each
-label, percentage, and countdown aligned above its micro gauge. Drag anywhere
-on its surface; a short click still opens the detail popup. It stays above
-normal windows, remembers its position across restarts, remains inside the
-active work area with an 8-logical-pixel safety margin, and can be reset from
-**Settings**. Pairing these two distinct views with the single neutral app-icon
-mode avoids repeating the same number in the tray.
-
-### Tray icons
-
-<img src=".github/tray-icons.png" alt="Claude Code, Codex, and Antigravity tray icons">
-
-With **Icons** enabled, one icon appears per enabled provider:
-the number and adaptive bars follow the quota windows that provider actually
-reports. With no data, the number gives way to the provider's initial; near a
-limit, it turns a warning colour. Disable the setting to keep one neutral app
-icon shared with the executable. The preview above is rendered by the app —
-run `.\gengchou.exe --dump-tray-icons .\preview` to export every
-provider-icon state.
+- Quota data comes from what each provider actually reports — windows and
+  reset times are never guessed or extrapolated
+- Enable any combination of Claude Code, Codex, and Google Antigravity
+- Windows system colours in High Contrast mode
+- Optional reset notifications (off by default)
+- Survives `explorer.exe` restarts and RDP / lock-screen transitions; polling
+  keeps its cadence while the session is locked, and restoration only rebuilds
+  local UI surfaces
+- Multi-monitor and multi-taskbar aware
+- 11 languages · no telemetry · a single ~1 MB portable executable
 
 ## Provider requirements
 
