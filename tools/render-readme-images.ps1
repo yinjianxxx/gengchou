@@ -4,7 +4,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\render-readme-images.ps1
 #
 # Outputs (all PNG, written to .github/readme/):
-#   detail-popup-en.png / detail-popup-zh.png   dark-theme detail popup, per language
+#   detail-popup-{en,zh}-{dark,light}.png       detail popup, per language and theme
 #   widget-badges-dark.png / -light.png         taskbar widget, normal state
 #   widget-badges-warn-dark.png                 taskbar widget, warning takeover
 #   floating-rows-dark.png / -light.png         floating window, normal state
@@ -36,8 +36,11 @@ try {
 
     # GUI-subsystem binary: Start-Process -Wait is required, the shell would
     # otherwise continue before the dump files exist.
-    Start-Process -Wait -FilePath $exe -ArgumentList '--dump-detail-popup', "$dumpRoot\popup-en", 'en', 'dark'
-    Start-Process -Wait -FilePath $exe -ArgumentList '--dump-detail-popup', "$dumpRoot\popup-zh", 'zh', 'dark'
+    foreach ($lang in @('en', 'zh')) {
+        foreach ($theme in @('dark', 'light')) {
+            Start-Process -Wait -FilePath $exe -ArgumentList '--dump-detail-popup', "$dumpRoot\popup-$lang-$theme", $lang, $theme
+        }
+    }
     Start-Process -Wait -FilePath $exe -ArgumentList '--dump-widget', "$dumpRoot\widget"
     Start-Process -Wait -FilePath $exe -ArgumentList '--dump-tray-icons', "$dumpRoot\tray"
 
@@ -49,8 +52,11 @@ try {
         Write-Host "wrote $pngPath"
     }
 
-    Convert-BmpToPng "$dumpRoot\popup-en\detail-popup.bmp" "$outDir\detail-popup-en.png"
-    Convert-BmpToPng "$dumpRoot\popup-zh\detail-popup.bmp" "$outDir\detail-popup-zh.png"
+    foreach ($lang in @('en', 'zh')) {
+        foreach ($theme in @('dark', 'light')) {
+            Convert-BmpToPng "$dumpRoot\popup-$lang-$theme\detail-popup.bmp" "$outDir\detail-popup-$lang-$theme.png"
+        }
+    }
     Convert-BmpToPng "$dumpRoot\widget\badges-normal-dark.bmp" "$outDir\widget-badges-dark.png"
     Convert-BmpToPng "$dumpRoot\widget\badges-normal-light.bmp" "$outDir\widget-badges-light.png"
     Convert-BmpToPng "$dumpRoot\widget\badges-warn-dark.bmp" "$outDir\widget-badges-warn-dark.png"

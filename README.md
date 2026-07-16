@@ -16,7 +16,7 @@
 [![Release](https://img.shields.io/github/v/release/yinjianxxx/gengchou)](https://github.com/yinjianxxx/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-<img src=".github/readme/detail-popup-en.png" alt="Detail popup: Claude Code flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="440">
+<img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup: Claude Code flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="440">
 
 <sub>The detail popup — including what a near-limit warning looks like.</sub>
 
@@ -41,6 +41,7 @@ it is now developed independently ([provenance](PROVENANCE.md)).
 | **Taskbar widget** | <img src=".github/readme/widget-badges-dark.png" alt="Taskbar widget, dark theme: one badge per provider with logo, window label, and usage percentage"> | <img src=".github/readme/widget-badges-light.png" alt="Taskbar widget, light theme"> |
 | **Floating window** | <img src=".github/readme/floating-rows-dark.png" alt="Floating window, dark theme: up to two quota windows per provider with percentages, countdowns, and micro gauges"> | <img src=".github/readme/floating-rows-light.png" alt="Floating window, light theme"> |
 | **Tray icons** | <img src=".github/readme/tray-icons-dark.png" alt="Tray icons, dark theme: per-provider usage numbers over adaptive bars"> | <img src=".github/readme/tray-icons-light.png" alt="Tray icons, light theme"> |
+| **Detail popup** | <img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup, dark theme" width="320"> | <img src=".github/readme/detail-popup-en-light.png" alt="Detail popup, light theme" width="320"> |
 
 These previews are not screenshots: the app rendered them through its own
 `--dump-widget`, `--dump-tray-icons`, and `--dump-detail-popup` modes, so they
