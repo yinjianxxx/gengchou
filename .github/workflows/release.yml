@@ -30,20 +30,20 @@ jobs:
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
           $package = $metadata.packages |
-            Where-Object { $_.name -eq "ai-usage-monitor" } |
+            Where-Object { $_.name -eq "gengchou" } |
             Select-Object -First 1
           if ($null -eq $package) {
-            throw "Package ai-usage-monitor was not found."
+            throw "Package gengchou was not found."
           }
           $expectedTag = "v$($package.version)"
           if ($env:GITHUB_REF_NAME -ne $expectedTag) {
             throw "Tag $env:GITHUB_REF_NAME does not match Cargo version $expectedTag."
           }
           $binary = $package.targets |
-            Where-Object { ($_.kind -contains "bin") -and ($_.name -eq "ai-usage-monitor") } |
+            Where-Object { ($_.kind -contains "bin") -and ($_.name -eq "gengchou") } |
             Select-Object -First 1
           if ($null -eq $binary) {
-            throw "Binary target ai-usage-monitor was not found."
+            throw "Binary target gengchou was not found."
           }
 
       - name: Check formatting
@@ -75,7 +75,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          Copy-Item -LiteralPath target\release\ai-usage-monitor.exe -Destination dist\ai-usage-monitor.exe
+          Copy-Item -LiteralPath target\release\gengchou.exe -Destination dist\gengchou.exe
+          Copy-Item -LiteralPath target\release\gengchou.exe -Destination dist\ai-usage-monitor.exe
           Copy-Item -LiteralPath LICENSE -Destination dist\LICENSE
           Copy-Item -LiteralPath THIRD_PARTY_NOTICES.md -Destination dist\THIRD_PARTY_NOTICES.md
           Copy-Item -LiteralPath DEPENDENCY_LICENSES.md -Destination dist\DEPENDENCY_LICENSES.md
@@ -83,7 +84,18 @@ jobs:
           Copy-Item -LiteralPath README.zh-CN.md -Destination dist\README.zh-CN.md
           Copy-Item -LiteralPath PROVENANCE.md -Destination dist\PROVENANCE.md
 
-          $bundleFiles = @(
+          $newBundleFiles = @(
+            "dist\gengchou.exe",
+            "dist\LICENSE",
+            "dist\THIRD_PARTY_NOTICES.md",
+            "dist\DEPENDENCY_LICENSES.md",
+            "dist\README.md",
+            "dist\README.zh-CN.md",
+            "dist\PROVENANCE.md"
+          )
+          Compress-Archive -LiteralPath $newBundleFiles -DestinationPath dist\gengchou-windows-x64.zip -Force
+
+          $legacyBundleFiles = @(
             "dist\ai-usage-monitor.exe",
             "dist\LICENSE",
             "dist\THIRD_PARTY_NOTICES.md",
@@ -92,11 +104,10 @@ jobs:
             "dist\README.zh-CN.md",
             "dist\PROVENANCE.md"
           )
-          Compress-Archive -LiteralPath $bundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
+          Compress-Archive -LiteralPath $legacyBundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $requiredBundleEntries = @(
-            'ai-usage-monitor.exe',
+          $requiredCommonEntries = @(
             'LICENSE',
             'THIRD_PARTY_NOTICES.md',
             'DEPENDENCY_LICENSES.md',
@@ -104,22 +115,30 @@ jobs:
             'README.zh-CN.md',
             'PROVENANCE.md'
           )
-          $archive = [System.IO.Compression.ZipFile]::OpenRead(
-            (Resolve-Path -LiteralPath dist\ai-usage-monitor-windows-x64.zip)
+          $bundles = @(
+            @{ Path = 'dist\gengchou-windows-x64.zip'; Exe = 'gengchou.exe' },
+            @{ Path = 'dist\ai-usage-monitor-windows-x64.zip'; Exe = 'ai-usage-monitor.exe' }
           )
-          try {
-            $bundleEntries = @($archive.Entries | ForEach-Object { $_.FullName })
-            foreach ($requiredEntry in $requiredBundleEntries) {
-              if ($requiredEntry -notin $bundleEntries) {
-                throw ('Release bundle is missing required entry: {0}' -f $requiredEntry)
+          foreach ($bundle in $bundles) {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead(
+              (Resolve-Path -LiteralPath $bundle.Path)
+            )
+            try {
+              $bundleEntries = @($archive.Entries | ForEach-Object { $_.FullName })
+              foreach ($requiredEntry in @($bundle.Exe) + $requiredCommonEntries) {
+                if ($requiredEntry -notin $bundleEntries) {
+                  throw ('Release bundle {0} is missing required entry: {1}' -f $bundle.Path, $requiredEntry)
+                }
               }
             }
-          }
-          finally {
-            $archive.Dispose()
+            finally {
+              $archive.Dispose()
+            }
           }
 
           $assetNames = @(
+            "gengchou.exe",
+            "gengchou-windows-x64.zip",
             "ai-usage-monitor.exe",
             "ai-usage-monitor-windows-x64.zip",
             "LICENSE",
@@ -137,6 +156,8 @@ jobs:
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
+            dist/gengchou.exe
+            dist/gengchou-windows-x64.zip
             dist/ai-usage-monitor.exe
             dist/ai-usage-monitor-windows-x64.zip
 
@@ -156,6 +177,8 @@ jobs:
           }
 
           gh release create $env:GITHUB_REF_NAME `
+            dist/gengchou.exe `
+            dist/gengchou-windows-x64.zip `
             dist/ai-usage-monitor.exe `
             dist/ai-usage-monitor-windows-x64.zip `
             dist/LICENSE `
@@ -164,7 +187,7 @@ jobs:
             dist/SHA256SUMS `
             --verify-tag `
             --draft `
-            --title "AI Usage Monitor $env:GITHUB_REF_NAME" `
+            --title "Gengchou $env:GITHUB_REF_NAME" `
             --notes-file $notesFile
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -188,6 +211,8 @@ jobs:
             $verifiedNames += $Matches.name
           }
           $requiredVerifiedAssets = @(
+            'gengchou.exe',
+            'gengchou-windows-x64.zip',
             'ai-usage-monitor.exe',
             'ai-usage-monitor-windows-x64.zip',
             'LICENSE',
@@ -200,6 +225,10 @@ jobs:
             }
           }
 
+          gh attestation verify release-verify\gengchou.exe --repo $env:GH_REPO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh attestation verify release-verify\gengchou-windows-x64.zip --repo $env:GH_REPO
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh attestation verify release-verify\ai-usage-monitor.exe --repo $env:GH_REPO
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh attestation verify release-verify\ai-usage-monitor-windows-x64.zip --repo $env:GH_REPO
