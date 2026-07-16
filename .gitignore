@@ -39,3 +39,6 @@ AGENTS.md
 /.agents/
 /.claude/
 /.codex/
+
+# Private planning and research notes (never publish)
+/docs/superpowers/
