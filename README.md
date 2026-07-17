@@ -9,7 +9,7 @@
 
 **AI quota at a glance.**
 
-<sub>AI usage monitor for the Windows taskbar · Formerly AI Usage Monitor</sub>
+<sub>AI usage monitor for the Windows taskbar</sub>
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![CI](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml)
@@ -36,12 +36,6 @@ The name *Gengchou* (更筹) comes from the tally sticks used to mark the watche
 of the night; by extension, the term can also refer to time itself. These
 tally sticks made the passing hours visible; the app does the same for quota
 usage and reset cycles.
-
-Formerly **AI Usage Monitor**: the rename changed the product's name, not
-your data — settings, cache, and the update path all carry over. Originally
-derived from
-[CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor),
-it is now developed independently ([provenance](PROVENANCE.md)).
 
 ## Surfaces at a glance
 
@@ -205,7 +199,7 @@ are logged instead of silently ending the process. See
 
 ## Acknowledgements & license
 
-Derived from
+Formerly **AI Usage Monitor**, Gengchou was derived from
 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor)
 v1.4.8 (commit `9b29972`). The tray-icon presentation and parts of the Claude
 usage polling, caching, cooldown, and rate-limit handling were adapted from or
