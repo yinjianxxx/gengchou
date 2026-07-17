@@ -2337,7 +2337,7 @@ mod tests {
     #[test]
     fn missing_windows_credential_has_stable_signature() {
         let path = std::env::temp_dir().join(format!(
-            "aium-missing-credential-{}-{}",
+            "gengchou-missing-credential-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -41,6 +41,21 @@ jobs:
       - name: Build updater helper test binary
         run: cargo build --locked
 
+      - name: Test legacy updater inbound bridge
+        shell: pwsh
+        timeout-minutes: 1
+        run: .\tests\legacy_updater_inbound_e2e.ps1
+
+      - name: Test released v2.2.3 updater bridge and rollback
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\v2.2.3_updater_bridge_e2e.ps1 -AllowRealUserProfileWrite
+
+      - name: Test identity migration state machine
+        shell: pwsh
+        timeout-minutes: 1
+        run: .\tests\migration_e2e.ps1
+
       - name: Test updater helper success hand-off
         shell: pwsh
         timeout-minutes: 3

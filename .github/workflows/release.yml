@@ -58,6 +58,26 @@ jobs:
       - name: Build updater helper test binary
         run: cargo build --locked
 
+      - name: Test legacy updater inbound bridge
+        shell: pwsh
+        timeout-minutes: 1
+        run: .\tests\legacy_updater_inbound_e2e.ps1
+
+      - name: Test released v2.2.3 updater bridge and rollback
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\v2.2.3_updater_bridge_e2e.ps1 -AllowRealUserProfileWrite
+
+      - name: Test released v2.2.3 helper with the actual v2.2.4 application
+        shell: pwsh
+        timeout-minutes: 3
+        run: .\tests\v2.2.3_to_v2.2.4_real_e2e.ps1 -AllowInteractiveDesktopAndRealProfileWrite
+
+      - name: Test identity migration state machine
+        shell: pwsh
+        timeout-minutes: 1
+        run: .\tests\migration_e2e.ps1
+
       - name: Test updater helper success hand-off
         shell: pwsh
         timeout-minutes: 3
@@ -83,6 +103,7 @@ jobs:
           Copy-Item -LiteralPath README.md -Destination dist\README.md
           Copy-Item -LiteralPath README.zh-CN.md -Destination dist\README.zh-CN.md
           Copy-Item -LiteralPath PROVENANCE.md -Destination dist\PROVENANCE.md
+          Copy-Item -LiteralPath tools\verify-v2.2.4-migration.ps1 -Destination dist\verify-v2.2.4-migration.ps1
 
           $newBundleFiles = @(
             "dist\gengchou.exe",
@@ -91,7 +112,8 @@ jobs:
             "dist\DEPENDENCY_LICENSES.md",
             "dist\README.md",
             "dist\README.zh-CN.md",
-            "dist\PROVENANCE.md"
+            "dist\PROVENANCE.md",
+            "dist\verify-v2.2.4-migration.ps1"
           )
           Compress-Archive -LiteralPath $newBundleFiles -DestinationPath dist\gengchou-windows-x64.zip -Force
 
@@ -102,7 +124,8 @@ jobs:
             "dist\DEPENDENCY_LICENSES.md",
             "dist\README.md",
             "dist\README.zh-CN.md",
-            "dist\PROVENANCE.md"
+            "dist\PROVENANCE.md",
+            "dist\verify-v2.2.4-migration.ps1"
           )
           Compress-Archive -LiteralPath $legacyBundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
 
@@ -113,7 +136,8 @@ jobs:
             'DEPENDENCY_LICENSES.md',
             'README.md',
             'README.zh-CN.md',
-            'PROVENANCE.md'
+            'PROVENANCE.md',
+            'verify-v2.2.4-migration.ps1'
           )
           $bundles = @(
             @{ Path = 'dist\gengchou-windows-x64.zip'; Exe = 'gengchou.exe' },
@@ -130,6 +154,9 @@ jobs:
                   throw ('Release bundle {0} is missing required entry: {1}' -f $bundle.Path, $requiredEntry)
                 }
               }
+              if ($bundleEntries.Count -ne 8) {
+                throw ('Release bundle {0} has {1} entries; expected exactly 8.' -f $bundle.Path, $bundleEntries.Count)
+              }
             }
             finally {
               $archive.Dispose()
@@ -141,6 +168,7 @@ jobs:
             "gengchou-windows-x64.zip",
             "ai-usage-monitor.exe",
             "ai-usage-monitor-windows-x64.zip",
+            "verify-v2.2.4-migration.ps1",
             "LICENSE",
             "THIRD_PARTY_NOTICES.md",
             "DEPENDENCY_LICENSES.md"
@@ -181,6 +209,7 @@ jobs:
             dist/gengchou-windows-x64.zip `
             dist/ai-usage-monitor.exe `
             dist/ai-usage-monitor-windows-x64.zip `
+            dist/verify-v2.2.4-migration.ps1 `
             dist/LICENSE `
             dist/THIRD_PARTY_NOTICES.md `
             dist/DEPENDENCY_LICENSES.md `
@@ -215,6 +244,7 @@ jobs:
             'gengchou-windows-x64.zip',
             'ai-usage-monitor.exe',
             'ai-usage-monitor-windows-x64.zip',
+            'verify-v2.2.4-migration.ps1',
             'LICENSE',
             'THIRD_PARTY_NOTICES.md',
             'DEPENDENCY_LICENSES.md'
@@ -223,6 +253,20 @@ jobs:
             if ($name -notin $verifiedNames) {
               throw ('SHA256SUMS is missing required release asset: {0}' -f $name)
             }
+          }
+          if ($verifiedNames.Count -ne $requiredVerifiedAssets.Count) {
+            throw ('SHA256SUMS has {0} payload entries; expected exactly {1}.' -f $verifiedNames.Count, $requiredVerifiedAssets.Count)
+          }
+          $downloadedNames = @(
+            Get-ChildItem -LiteralPath release-verify -File |
+              ForEach-Object { $_.Name }
+          )
+          $expectedDownloadedNames = @($requiredVerifiedAssets) + 'SHA256SUMS'
+          if (
+            $downloadedNames.Count -ne $expectedDownloadedNames.Count -or
+            @($downloadedNames | Where-Object { $_ -notin $expectedDownloadedNames }).Count -ne 0
+          ) {
+            throw ('Draft release has an unexpected asset set: {0}' -f ($downloadedNames -join ', '))
           }
 
           gh attestation verify release-verify\gengchou.exe --repo $env:GH_REPO

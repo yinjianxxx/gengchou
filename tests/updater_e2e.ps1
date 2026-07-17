@@ -3,6 +3,9 @@ param(
     [string]$HelperPath = '',
     [ValidateSet('Success', 'ChildExit')]
     [string]$Scenario = 'Success',
+    [ValidateSet('Current', 'Legacy')]
+    [string]$Protocol = 'Current',
+    [switch]$AllowRealUserProfileWrite,
     [ValidateRange(10, 120)]
     [int]$TimeoutSeconds = 45
 )
@@ -200,7 +203,22 @@ $rustc = Get-Command rustc -ErrorAction Stop
 $fixtureDir = Join-Path $PSScriptRoot 'fixtures'
 $e2eRoot = Join-Path $repoRoot 'target\updater-e2e'
 $testRoot = Join-Path $e2eRoot ([guid]::NewGuid().ToString('N'))
-$readyDir = Join-Path $testRoot 'ready'
+$readyDir = if ($Protocol -eq 'Legacy') {
+    if (-not $AllowRealUserProfileWrite) {
+        throw 'Legacy protocol testing writes a unique marker under the real user profile; rerun only in an isolated profile with -AllowRealUserProfileWrite.'
+    }
+    Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'AIUsageMonitor\updates'
+}
+else {
+    Join-Path $testRoot 'ready'
+}
+$legacyReadyDirExisted = $Protocol -eq 'Legacy' -and (Test-Path -LiteralPath $readyDir)
+$diagnoseLog = if ($Protocol -eq 'Legacy') {
+    Join-Path $testRoot 'AIUsageMonitor\diagnose.log'
+}
+else {
+    Join-Path $testRoot 'Gengchou\diagnose.log'
+}
 $target = Join-Path $testRoot 'app-under-test.exe'
 $source = Join-Path $testRoot 'vnext-source.exe'
 $parentMarker = [IO.Path]::ChangeExtension($target, 'parent-ready')
@@ -213,8 +231,11 @@ $helperProcess = $null
 $vnextProcess = $null
 $vnextPid = $null
 $restartedParentProcess = $null
+$restartedPidText = $null
+$legacyFailureDialogStopped = $false
 
 try {
+    New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $readyDir -Force | Out-Null
 
     & $rustc.Source (Join-Path $fixtureDir 'updater_parent.rs') --edition=2021 -C debuginfo=0 -o $target
@@ -245,10 +266,14 @@ try {
         throw "Parent fixture reported PID $reportedParentPid, expected $($parentProcess.Id)."
     }
 
-    $helperEnvironment = @{
-        'LOCALAPPDATA' = $testRoot
-        'AIUM_UPDATE_TEST_READY_DIR' = $readyDir
-        'AIUM_UPDATE_TEST_NO_UI' = '1'
+    $helperEnvironment = @{ 'LOCALAPPDATA' = $testRoot }
+    if ($Protocol -eq 'Legacy') {
+        $helperEnvironment['AIUM_UPDATE_TEST_READY_DIR'] = $readyDir
+        $helperEnvironment['AIUM_UPDATE_TEST_NO_UI'] = '1'
+    }
+    else {
+        $helperEnvironment['GENGCHOU_UPDATE_TEST_READY_DIR'] = $readyDir
+        $helperEnvironment['GENGCHOU_UPDATE_TEST_NO_UI'] = '1'
     }
     $helperArguments = @(
         '--apply-update',
@@ -273,13 +298,28 @@ try {
         throw 'The old parent fixture did not exit within five seconds.'
     }
 
-    if (-not $helperProcess.WaitForExit($TimeoutSeconds * 1000)) {
+    if ($Scenario -eq 'ChildExit' -and $Protocol -eq 'Legacy') {
+        # The released v2.2.3 helper shows a modal "Update failed" dialog after
+        # a successful rollback. In automation there is no user to dismiss it,
+        # so the restored parent is the completion signal and the helper is
+        # stopped only after that durable evidence appears.
+        $restartedPidText = Wait-ForNonEmptyFile `
+            -Path $parentMarker `
+            -Description 'the restarted old parent fixture' `
+            -TimeoutSeconds $TimeoutSeconds
+        if (-not $helperProcess.HasExited) {
+            $helperProcess.Kill()
+            [void]$helperProcess.WaitForExit(5000)
+            $legacyFailureDialogStopped = $true
+        }
+    }
+    elseif (-not $helperProcess.WaitForExit($TimeoutSeconds * 1000)) {
         $helperProcess.Kill()
         [void]$helperProcess.WaitForExit(5000)
         throw "Updater helper exceeded the $TimeoutSeconds-second test timeout."
     }
     $expectedHelperExit = if ($Scenario -eq 'Success') { 0 } else { 1 }
-    if ($helperProcess.ExitCode -ne $expectedHelperExit) {
+    if (-not $legacyFailureDialogStopped -and $helperProcess.ExitCode -ne $expectedHelperExit) {
         throw "Updater helper exited with $($helperProcess.ExitCode); scenario $Scenario expected $expectedHelperExit."
     }
 
@@ -340,7 +380,6 @@ try {
             throw "Updater did not clean the consumed ready marker: $normalizedReadyPath"
         }
 
-        $diagnoseLog = Join-Path $testRoot 'AIUsageMonitor\diagnose.log'
         if (-not (Test-Path -LiteralPath $diagnoseLog -PathType Leaf)) {
             throw 'Updater helper did not keep its diagnostic log inside the test directory.'
         }
@@ -348,12 +387,14 @@ try {
         Write-Output (
             (
                 'Updater E2E passed: old PID {0} exited; new PID {1} is alive; ' +
-                'target hash, ready hand-off, and transaction cleanup verified.'
-            ) -f $parentProcess.Id, $vnextPid
+                'target hash, {2} ready hand-off, and transaction cleanup verified.'
+            ) -f $parentProcess.Id, $vnextPid, $Protocol
         )
     }
     else {
-        $restartedPidText = Wait-ForNonEmptyFile -Path $parentMarker -Description 'the restarted old parent fixture'
+        if ($null -eq $restartedPidText) {
+            $restartedPidText = Wait-ForNonEmptyFile -Path $parentMarker -Description 'the restarted old parent fixture'
+        }
         $restartedPid = [int]::Parse($restartedPidText)
         if ($restartedPid -eq $parentProcess.Id) {
             throw "Rollback marker still reports the original parent PID $restartedPid."
@@ -401,7 +442,8 @@ try {
         }
 
         $unexpectedReadyMarkers = @(
-            Get-ChildItem -LiteralPath $readyDir -File -Filter 'update-ready-*.marker'
+            Get-ChildItem -LiteralPath $readyDir -File `
+                -Filter "update-ready-$($helperProcess.Id)-*.marker"
         )
         if ($unexpectedReadyMarkers.Count -ne 0) {
             throw (
@@ -410,7 +452,6 @@ try {
             )
         }
 
-        $diagnoseLog = Join-Path $testRoot 'AIUsageMonitor\diagnose.log'
         if (-not (Test-Path -LiteralPath $diagnoseLog -PathType Leaf)) {
             throw 'Updater helper did not keep its diagnostic log inside the test directory.'
         }
@@ -418,20 +459,19 @@ try {
         Write-Output (
             (
                 'Updater ChildExit E2E passed: helper rejected the child, ' +
-                'restored old hash, relaunched PID {0}, and retained verified .old.'
-            ) -f $restartedPid
+                'restored old hash, relaunched PID {0}, retained verified .old, protocol={1}.'
+            ) -f $restartedPid, $Protocol
         )
     }
 }
 catch {
-    $failureLog = Join-Path $testRoot 'AIUsageMonitor\diagnose.log'
-    if (Test-Path -LiteralPath $failureLog -PathType Leaf) {
+    if (Test-Path -LiteralPath $diagnoseLog -PathType Leaf) {
         Write-Warning 'Updater helper diagnostic log follows:'
-        Get-Content -LiteralPath $failureLog -ErrorAction SilentlyContinue |
+        Get-Content -LiteralPath $diagnoseLog -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Warning $_ }
     }
     else {
-        Write-Warning "Updater helper diagnostic log was not found at $failureLog"
+        Write-Warning "Updater helper diagnostic log was not found at $diagnoseLog"
     }
     throw
 }
@@ -443,4 +483,19 @@ finally {
     Stop-ProcessesAtExecutable -ExecutablePath $target
     Start-Sleep -Milliseconds 100
     Remove-TestDirectory -Path $testRoot -AllowedParent $e2eRoot
+    if (
+        $Protocol -eq 'Legacy' -and
+        -not $legacyReadyDirExisted -and
+        (Test-Path -LiteralPath $readyDir -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $readyDir -Force).Count -eq 0
+    ) {
+        Remove-Item -LiteralPath $readyDir -Force
+        $legacyRoot = Split-Path -Parent $readyDir
+        if (
+            (Test-Path -LiteralPath $legacyRoot -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $legacyRoot -Force).Count -eq 0
+        ) {
+            Remove-Item -LiteralPath $legacyRoot -Force
+        }
+    }
 }

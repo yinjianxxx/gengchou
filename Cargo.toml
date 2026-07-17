@@ -3,11 +3,11 @@ name = "gengchou"
 # Versioning starts at 2.x, above the original project's 1.x line: also
 # guarantees the manual update check never treats an upstream 1.x release as
 # newer (see updater::is_version_newer).
-version = "2.2.3"
+version = "2.2.4"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
-description = "Gengchou — AI usage monitor for the Windows taskbar"
+description = "Gengchou — AI quota monitor for the Windows taskbar"
 homepage = "https://github.com/yinjianxxx/gengchou"
 repository = "https://github.com/yinjianxxx/gengchou"
 

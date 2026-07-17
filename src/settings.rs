@@ -1,13 +1,15 @@
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
 
 use crate::diagnose;
 use crate::tray_icon::TrayIconKind;
 
-pub const APP_DIR_NAME: &str = "AIUsageMonitor";
-const LEGACY_APP_DIR_NAME: &str = "ClaudeCodexUsageMonitor";
+pub const APP_DIR_NAME: &str = "Gengchou";
 
 pub const POLL_1_MIN: u32 = 60_000;
 pub const POLL_2_MIN: u32 = 120_000;
@@ -125,7 +127,7 @@ fn normalize_provider_order(configured: &[TrayIconKind]) -> Vec<TrayIconKind> {
     normalized
 }
 
-fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
+pub(crate) fn normalize(settings: &mut SettingsFile) -> Vec<&'static str> {
     let mut repaired = Vec::new();
     if settings.tray_offset < 0 {
         settings.tray_offset = 0;
@@ -160,7 +162,9 @@ fn settings_path_for(app_dir_name: &str) -> PathBuf {
 }
 
 fn app_data_dir(app_dir_name: &str) -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    let appdata = std::env::var_os("APPDATA")
+        .filter(|value| !value.is_empty())
+        .expect("APPDATA must be available before settings are loaded");
     PathBuf::from(appdata).join(app_dir_name)
 }
 
@@ -168,26 +172,14 @@ pub fn app_data_file(name: &str) -> PathBuf {
     app_data_dir(APP_DIR_NAME).join(name)
 }
 
-fn read_settings_content() -> Option<(String, bool)> {
+fn read_settings_content() -> Option<String> {
     let current_path = settings_path_for(APP_DIR_NAME);
     match std::fs::read_to_string(&current_path) {
-        Ok(content) => return Some((content, false)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => diagnose::log_error(
-            &format!("settings read failed path={}", current_path.display()),
-            error,
-        ),
-    }
-    let legacy_path = settings_path_for(LEGACY_APP_DIR_NAME);
-    match std::fs::read_to_string(&legacy_path) {
-        Ok(content) => {
-            diagnose::log("loaded legacy settings for one-time migration");
-            Some((content, true))
-        }
+        Ok(content) => Some(content),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
             diagnose::log_error(
-                &format!("legacy settings read failed path={}", legacy_path.display()),
+                &format!("settings read failed path={}", current_path.display()),
                 error,
             );
             None
@@ -196,7 +188,7 @@ fn read_settings_content() -> Option<(String, bool)> {
 }
 
 pub(crate) fn load() -> SettingsFile {
-    let Some((content, loaded_legacy)) = read_settings_content() else {
+    let Some(content) = read_settings_content() else {
         return SettingsFile::default();
     };
     let mut settings: SettingsFile = match serde_json::from_str(&content) {
@@ -212,12 +204,21 @@ pub(crate) fn load() -> SettingsFile {
     if !repaired.is_empty() {
         diagnose::log(format!("settings normalized fields={}", repaired.join(",")));
     }
-    if loaded_legacy || !repaired.is_empty() {
+    if !repaired.is_empty() {
         if let Err(error) = save(&settings) {
-            diagnose::log_error("settings migration/normalization save failed", error);
+            diagnose::log_error("settings normalization save failed", error);
         }
     }
     settings
+}
+
+pub(crate) fn normalized_json(content: &str) -> Result<(SettingsFile, String), String> {
+    let mut settings: SettingsFile =
+        serde_json::from_str(content).map_err(|error| format!("invalid settings JSON: {error}"))?;
+    normalize(&mut settings);
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|error| format!("unable to serialize normalized settings: {error}"))?;
+    Ok((settings, json))
 }
 
 pub(crate) fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
@@ -236,12 +237,39 @@ pub(crate) fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
         }
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(&tmp, path) {
+    let replace_result = if path.exists() {
+        let path_wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let tmp_wide: Vec<u16> = tmp
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            ReplaceFileW(
+                PCWSTR::from_raw(path_wide.as_ptr()),
+                PCWSTR::from_raw(tmp_wide.as_ptr()),
+                PCWSTR::null(),
+                REPLACE_FILE_FLAGS(0),
+                None,
+                None,
+            )
+        }
+        .map_err(io::Error::other)
+    } else {
+        std::fs::rename(&tmp, path)
+    };
+    if let Err(error) = replace_result {
         if let Err(cleanup_error) = std::fs::remove_file(&tmp) {
-            diagnose::log_error(
-                &format!("atomic write cleanup failed path={}", tmp.display()),
-                cleanup_error,
-            );
+            if cleanup_error.kind() != io::ErrorKind::NotFound {
+                diagnose::log_error(
+                    &format!("atomic write cleanup failed path={}", tmp.display()),
+                    cleanup_error,
+                );
+            }
         }
         return Err(error);
     }
@@ -356,7 +384,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "ai-usage-monitor-settings-test-{}-{nonce}",
+            "gengchou-settings-test-{}-{nonce}",
             std::process::id(),
         ));
         let path = root.join("nested").join("settings.json");
@@ -376,7 +404,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "ai-usage-monitor-settings-error-test-{}-{nonce}",
+            "gengchou-settings-error-test-{}-{nonce}",
             std::process::id(),
         ));
         std::fs::write(&root, "not a directory").unwrap();

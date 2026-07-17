@@ -1,8 +1,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,14 +25,18 @@ const LEGACY_RELEASE_ASSET_NAME: &str = "ai-usage-monitor.exe";
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
-const UPDATE_READY_ENV: &str = "AIUM_UPDATE_READY_FILE";
+const UPDATE_READY_ENV: &str = "GENGCHOU_UPDATE_READY_FILE";
+const LEGACY_UPDATE_READY_ENV: &str = "AIUM_UPDATE_READY_FILE";
 #[cfg(debug_assertions)]
-const UPDATE_TEST_READY_DIR_ENV: &str = "AIUM_UPDATE_TEST_READY_DIR";
+const UPDATE_TEST_READY_DIR_ENV: &str = "GENGCHOU_UPDATE_TEST_READY_DIR";
 #[cfg(debug_assertions)]
-const UPDATE_TEST_NO_UI_ENV: &str = "AIUM_UPDATE_TEST_NO_UI";
+const LEGACY_UPDATE_TEST_READY_DIR_ENV: &str = "AIUM_UPDATE_TEST_READY_DIR";
+#[cfg(debug_assertions)]
+const UPDATE_TEST_NO_UI_ENV: &str = "GENGCHOU_UPDATE_TEST_NO_UI";
 const UPDATE_READY_PREFIX: &str = "update-ready-";
 const UPDATE_READY_SUFFIX: &str = ".marker";
-const UPDATE_READY_CONTENT: &[u8] = b"AIUM update ready\n";
+const UPDATE_READY_CONTENT: &[u8] = b"Gengchou update ready\n";
+const LEGACY_UPDATE_READY_CONTENT: &[u8] = b"AIUM update ready\n";
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_READY_GRACE: Duration = Duration::from_secs(2);
@@ -42,10 +47,17 @@ const MAX_UPDATE_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CHECKSUM_MANIFEST_BYTES: u64 = 1024 * 1024;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
 // Keep this aligned with the package identifier used in winget-pkgs.
 const WINGET_PACKAGE_ID: &str = "yinjianxxx.Gengchou";
 
 static UPDATE_READY_CONFIRMED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyProtocol {
+    Current,
+    Legacy,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
@@ -79,6 +91,17 @@ struct GitHubAsset {
 }
 
 pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
+    #[cfg(debug_assertions)]
+    if args.get(1).map(String::as_str) == Some("--confirm-update-ready-test") {
+        return Some(match confirm_update_ready() {
+            Ok(()) => 0,
+            Err(error) => {
+                crate::diagnose::log(format!("update readiness test failed: {error}"));
+                1
+            }
+        });
+    }
+
     if args.get(1).map(String::as_str) == Some("--apply-update") {
         let result = if args.len() != 6 {
             Err(
@@ -106,6 +129,18 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
     }
 
     None
+}
+
+pub(crate) fn update_ready_requested() -> Result<bool, String> {
+    let current = std::env::var_os(UPDATE_READY_ENV).is_some();
+    let legacy = std::env::var_os(LEGACY_UPDATE_READY_ENV).is_some();
+    if current && legacy {
+        return Err(
+            "Both current and legacy update readiness variables are present; startup was refused."
+                .to_string(),
+        );
+    }
+    Ok(current || legacy)
 }
 
 fn parse_update_pid(value: &str) -> Result<u32, String> {
@@ -212,6 +247,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
         // A process installed by an earlier update inherits this variable.
         // The helper must never mistake that stale marker for its own child.
         .env_remove(UPDATE_READY_ENV)
+        .env_remove(LEGACY_UPDATE_READY_ENV)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -337,18 +373,32 @@ fn apply_update(
 /// It is idempotent within a process. Normal launches have no marker to write;
 /// at that same healthy milestone they may remove a backup orphaned by a
 /// helper that was interrupted after a previous successful replacement.
+fn inbound_ready_request() -> Result<Option<(PathBuf, ReadyProtocol)>, String> {
+    let current = std::env::var_os(UPDATE_READY_ENV).map(PathBuf::from);
+    let legacy = std::env::var_os(LEGACY_UPDATE_READY_ENV).map(PathBuf::from);
+    match (current, legacy) {
+        (Some(_), Some(_)) => Err(
+            "Both current and legacy update readiness variables are present; startup was refused."
+                .to_string(),
+        ),
+        (Some(marker), None) => Ok(Some((marker, ReadyProtocol::Current))),
+        (None, Some(marker)) => Ok(Some((marker, ReadyProtocol::Legacy))),
+        (None, None) => Ok(None),
+    }
+}
+
 pub fn confirm_update_ready() -> Result<(), String> {
     if UPDATE_READY_CONFIRMED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
 
     let result = (|| {
-        if let Some(marker) = std::env::var_os(UPDATE_READY_ENV) {
-            let marker = PathBuf::from(marker);
-            validate_ready_marker_path(&marker)?;
-            write_ready_marker(&marker)?;
+        if let Some((marker, protocol)) = inbound_ready_request()? {
+            validate_ready_marker_path(&marker, protocol)?;
+            write_ready_marker(&marker, protocol)?;
             // Do not let a later helper inherit a marker for this transaction.
             std::env::remove_var(UPDATE_READY_ENV);
+            std::env::remove_var(LEGACY_UPDATE_READY_ENV);
             return Ok(());
         }
 
@@ -920,9 +970,11 @@ fn relaunch_target(target: &Path, ready_marker: Option<&Path>) -> Result<Child, 
     match ready_marker {
         Some(marker) => {
             command.env(UPDATE_READY_ENV, marker);
+            command.env_remove(LEGACY_UPDATE_READY_ENV);
         }
         None => {
             command.env_remove(UPDATE_READY_ENV);
+            command.env_remove(LEGACY_UPDATE_READY_ENV);
         }
     }
 
@@ -1056,13 +1108,15 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<(), String> {
 }
 
 fn updates_dir() -> Result<PathBuf, String> {
-    // AIUsageMonitor, not the upstream ClaudeCodeUsageMonitor: the staging
-    // file names are fixed, so sharing the upstream directory would let two
-    // side-by-side apps overwrite each other's pending update.
+    dirs::data_local_dir()
+        .map(|dir| dir.join("Gengchou").join("updates"))
+        .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
+}
+
+fn legacy_updates_dir() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .map(|dir| dir.join("AIUsageMonitor").join("updates"))
-        .or_else(|| Some(std::env::temp_dir().join("AIUsageMonitor").join("updates")))
-        .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
+        .ok_or_else(|| "Unable to resolve the legacy local updates directory.".to_string())
 }
 
 fn ready_markers_dir() -> Result<PathBuf, String> {
@@ -1078,14 +1132,31 @@ fn ready_markers_dir() -> Result<PathBuf, String> {
     updates_dir()
 }
 
+fn legacy_ready_markers_dir() -> Result<PathBuf, String> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os(LEGACY_UPDATE_TEST_READY_DIR_ENV) {
+        let path = PathBuf::from(path);
+        if path.as_os_str().is_empty() {
+            return Err(format!(
+                "{LEGACY_UPDATE_TEST_READY_DIR_ENV} must not be empty."
+            ));
+        }
+        return Ok(path);
+    }
+
+    legacy_updates_dir()
+}
+
 fn new_ready_marker_path() -> Result<PathBuf, String> {
     let directory = ready_markers_dir()?;
+    validate_nearest_existing_ready_ancestor(&directory)?;
     std::fs::create_dir_all(&directory).map_err(|error| {
         format!(
             "Unable to create the update readiness directory at {}: {error}",
             directory.display()
         )
     })?;
+    validate_ready_directory(&directory)?;
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1104,8 +1175,44 @@ fn new_ready_marker_path() -> Result<PathBuf, String> {
     Err("Unable to reserve a unique update readiness marker.".to_string())
 }
 
-fn validate_ready_marker_path(marker: &Path) -> Result<(), String> {
-    let expected_parent = ready_markers_dir()?;
+fn validate_nearest_existing_ready_ancestor(path: &Path) -> Result<(), String> {
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        match std::fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
+                {
+                    return Err(format!(
+                        "Refusing non-directory or reparse-point update path {}.",
+                        current.display()
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                candidate = current.parent();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to inspect update readiness ancestor {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Unable to find an existing ancestor for update path {}.",
+        path.display()
+    ))
+}
+
+fn validate_ready_marker_path(marker: &Path, protocol: ReadyProtocol) -> Result<(), String> {
+    let expected_parent = match protocol {
+        ReadyProtocol::Current => ready_markers_dir()?,
+        ReadyProtocol::Legacy => legacy_ready_markers_dir()?,
+    };
     let parent = marker
         .parent()
         .ok_or_else(|| "The update readiness marker has no parent directory.".to_string())?;
@@ -1114,7 +1221,9 @@ fn validate_ready_marker_path(marker: &Path) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| "The update readiness marker name is invalid.".to_string())?;
 
-    if normalize_path(parent) != normalize_path(&expected_parent)
+    validate_ready_directory(&expected_parent)?;
+    if path_has_ambiguous_components(marker)
+        || normalize_path(parent) != normalize_path(&expected_parent)
         || !name.starts_with(UPDATE_READY_PREFIX)
         || !name.ends_with(UPDATE_READY_SUFFIX)
     {
@@ -1126,9 +1235,13 @@ fn validate_ready_marker_path(marker: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_ready_marker(marker: &Path) -> Result<(), String> {
-    if marker.exists() {
-        return if std::fs::read(marker).ok().as_deref() == Some(UPDATE_READY_CONTENT) {
+fn write_ready_marker(marker: &Path, protocol: ReadyProtocol) -> Result<(), String> {
+    let content = match protocol {
+        ReadyProtocol::Current => UPDATE_READY_CONTENT,
+        ReadyProtocol::Legacy => LEGACY_UPDATE_READY_CONTENT,
+    };
+    if validate_regular_file_if_exists(marker)? {
+        return if std::fs::read(marker).ok().as_deref() == Some(content) {
             Ok(())
         } else {
             Err("The update readiness marker already exists with invalid content.".to_string())
@@ -1142,7 +1255,7 @@ fn write_ready_marker(marker: &Path) -> Result<(), String> {
             .create_new(true)
             .open(&temporary)
             .map_err(|error| format!("Unable to create the update readiness marker: {error}"))?;
-        file.write_all(UPDATE_READY_CONTENT)
+        file.write_all(content)
             .and_then(|_| file.flush())
             .and_then(|_| file.sync_all())
             .map_err(|error| format!("Unable to persist the update readiness marker: {error}"))?;
@@ -1150,17 +1263,73 @@ fn write_ready_marker(marker: &Path) -> Result<(), String> {
             .map_err(|error| format!("Unable to publish the update readiness marker: {error}"))
     })();
 
-    if write_result.is_err()
-        && marker.exists()
-        && std::fs::read(marker).ok().as_deref() == Some(UPDATE_READY_CONTENT)
-    {
-        let _ = remove_file_if_exists(&temporary);
-        return Ok(());
-    }
     if write_result.is_err() {
+        match validate_regular_file_if_exists(marker) {
+            Ok(true) if std::fs::read(marker).ok().as_deref() == Some(content) => {
+                let _ = remove_file_if_exists(&temporary);
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = remove_file_if_exists(&temporary);
+                return Err(error);
+            }
+            _ => {}
+        }
         let _ = remove_file_if_exists(&temporary);
     }
     write_result
+}
+
+fn path_has_ambiguous_components(path: &Path) -> bool {
+    !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+}
+
+fn validate_ready_directory(path: &Path) -> Result<(), String> {
+    if path_has_ambiguous_components(path) {
+        return Err(format!(
+            "Refusing an ambiguous update readiness directory: {}.",
+            path.display()
+        ));
+    }
+    for candidate in [path.parent(), Some(path)].into_iter().flatten() {
+        let metadata = std::fs::symlink_metadata(candidate).map_err(|error| {
+            format!(
+                "Unable to inspect update readiness directory {}: {error}",
+                candidate.display()
+            )
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
+        {
+            return Err(format!(
+                "Refusing non-directory or reparse-point update path {}.",
+                candidate.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_regular_file_if_exists(path: &Path) -> Result<bool, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Unable to inspect {}: {error}", path.display())),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT_VALUE != 0
+    {
+        return Err(format!(
+            "Refusing non-regular update readiness marker {}.",
+            path.display()
+        ));
+    }
+    Ok(true)
 }
 
 fn updater_ui_disabled_for_tests() -> bool {
@@ -1199,7 +1368,6 @@ fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
             "if ($exitCode -eq 0) {{ ",
             "Start-Sleep -Seconds 2; ",
             "$installed = Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; ",
-            "if ($null -eq $installed) {{ $installed = Get-Command ai-usage-monitor -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 }}; ",
             "if ($null -ne $installed) {{ ",
             "$restartTarget = $installed.Source; ",
             "$restartDir = Split-Path -Parent $restartTarget ",
@@ -1286,7 +1454,7 @@ fn ensure_target_location_writable(target: &Path) -> Result<(), String> {
         "Unable to determine the install directory for the current executable.".to_string()
     })?;
 
-    let probe_path = parent.join(".__aium_update_probe");
+    let probe_path = parent.join(".__gengchou_update_probe");
     match File::create(&probe_path) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe_path);
@@ -1417,8 +1585,10 @@ mod tests {
     impl TestDir {
         fn new(name: &str) -> Self {
             let id = NEXT_TEST_DIR.fetch_add(1, AtomicOrdering::Relaxed);
-            let path = std::env::temp_dir()
-                .join(format!("aium-updater-{name}-{}-{id}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "gengchou-updater-{name}-{}-{id}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("test directory should be creatable");
             Self { path }
@@ -1433,6 +1603,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn readiness_paths_reject_ambiguous_components_and_non_regular_markers() {
+        assert!(path_has_ambiguous_components(Path::new(
+            r"C:\Users\Test\AppData\Local\Gengchou\..\Gengchou\updates\marker"
+        )));
+
+        let dir = TestDir::new("ready-marker-type");
+        let ready_dir = dir.join("ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        validate_ready_directory(&ready_dir).unwrap();
+        let marker = ready_dir.join("update-ready-1-2-0.marker");
+        std::fs::create_dir(&marker).unwrap();
+        assert!(validate_regular_file_if_exists(&marker).is_err());
     }
 
     #[test]
@@ -1759,14 +1944,12 @@ mod tests {
     }
 
     #[test]
-    fn winget_restart_prefers_the_new_portable_command_alias() {
+    fn winget_restart_uses_only_the_published_gengchou_command_alias() {
         let command = winget_upgrade_command(123, r"C:\old-version\app.exe", r"C:\old-version");
         assert!(command.contains(
             "Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue"
         ));
-        assert!(command.contains(
-            "Get-Command ai-usage-monitor -CommandType Application -ErrorAction SilentlyContinue"
-        ));
+        assert!(!command.contains("Get-Command ai-usage-monitor"));
         assert!(command.contains("$restartTarget = $installed.Source"));
         assert!(command.contains("Test-Path -LiteralPath $target -PathType Leaf"));
         assert!(command.contains("Start-Process -FilePath $restartTarget"));
