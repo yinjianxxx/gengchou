@@ -18,6 +18,10 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_RESET_POLL: usize = 3;
 pub const TIMER_UPDATE_CHECK: usize = 4;
+/// Re-checks the credentials on disk while polling is paused after an auth
+/// failure, so re-authenticating is noticed in seconds rather than at the
+/// next poll interval (up to an hour).
+pub const TIMER_AUTH_WATCH: usize = 5;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
