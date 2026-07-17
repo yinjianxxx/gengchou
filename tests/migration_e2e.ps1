@@ -37,28 +37,32 @@ function Invoke-MigrationStart {
         [string]$ExecutablePath = $BinaryPath
     )
 
-    $previous = @{}
-    foreach ($name in $Environment.Keys) {
-        $previous[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
-        [Environment]::SetEnvironmentVariable($name, [string]$Environment[$name], 'Process')
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $ExecutablePath
+    $startInfo.WorkingDirectory = $root
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    if ($startInfo.PSObject.Properties.Name -contains 'ArgumentList') {
+        $startInfo.ArgumentList.Add('--migration-e2e-ready')
     }
-    try {
-        $process = Start-Process -FilePath $ExecutablePath `
-            -ArgumentList '--migration-e2e-ready' `
-            -WorkingDirectory $root `
-            -WindowStyle Hidden `
-            -PassThru
-        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            $process.Kill()
-            throw 'Migration E2E process timed out.'
+    else {
+        $startInfo.Arguments = '--migration-e2e-ready'
+    }
+    foreach ($entry in $Environment.GetEnumerator()) {
+        if (($startInfo.PSObject.Properties.Name -contains 'Environment') -and
+            $null -ne $startInfo.Environment) {
+            $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
         }
-        return $process.ExitCode
-    }
-    finally {
-        foreach ($name in $previous.Keys) {
-            [Environment]::SetEnvironmentVariable($name, $previous[$name], 'Process')
+        else {
+            $startInfo.EnvironmentVariables[[string]$entry.Key] = [string]$entry.Value
         }
     }
+    $process = [Diagnostics.Process]::Start($startInfo)
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        $process.Kill()
+        throw 'Migration E2E process timed out.'
+    }
+    return $process.ExitCode
 }
 
 try {
