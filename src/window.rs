@@ -2399,36 +2399,23 @@ fn rate_limit_retry_ms(retry_after_ms: Option<u32>, poll_interval_ms: u32) -> u3
         .clamp(RATE_LIMIT_MIN_RETRY_MS, RATE_LIMIT_MAX_RETRY_MS)
 }
 
-fn credential_watch_mode_for_failure(
-    error: poller::PollError,
-    show_claude_code: bool,
-    show_codex: bool,
-    show_antigravity: bool,
-) -> Option<poller::CredentialWatchMode> {
-    if !matches!(
+/// Whether signing in could clear this failure.
+///
+/// The mode itself now comes from `credential_watch_mode_for_shown`, which is
+/// knowable before the poll runs - that is what lets the credentials be
+/// sampled either side of a poll and compared (see `auth_watch_decision`).
+///
+/// Dropping the old error-dependent mode is behaviour-preserving: it only
+/// differed by widening a Claude-only watch to `AllSources` on
+/// `NoCredentials`, and `ActiveSource` already falls back to every known
+/// source when no credentials are found.
+fn poll_error_needs_credential_watch(error: poller::PollError) -> bool {
+    matches!(
         error,
         poller::PollError::AuthRequired
             | poller::PollError::TokenExpired
             | poller::PollError::NoCredentials
-    ) {
-        return None;
-    }
-
-    let enabled_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
-    if enabled_count > 1 {
-        return Some(poller::CredentialWatchMode::AllProviders);
-    }
-    if show_codex {
-        return Some(poller::CredentialWatchMode::Codex);
-    }
-    if show_antigravity {
-        return Some(poller::CredentialWatchMode::Antigravity);
-    }
-    if show_claude_code && error == poller::PollError::NoCredentials {
-        Some(poller::CredentialWatchMode::AllSources)
-    } else {
-        Some(poller::CredentialWatchMode::ActiveSource)
-    }
+    )
 }
 /// Which credentials the shown providers could sign in through.
 ///
@@ -8391,13 +8378,18 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
         Err(failure) => {
             let e = failure.error;
             let failed_data = *failure.data;
-            let auth_watch = credential_watch_mode_for_failure(
-                e,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-            )
-            .map(|watch_mode| (watch_mode, poller::credential_watch_snapshot(watch_mode)));
+            // Same race as the success path: sampling only now would arm the
+            // baseline with credentials that were refreshed while the poll was
+            // in flight. Compare against the pre-poll sample instead.
+            let needs_watch = poll_error_needs_credential_watch(e);
+            let post_poll_snapshot = watch_mode
+                .filter(|_| needs_watch)
+                .map(poller::credential_watch_snapshot);
+            let watch_decision = auth_watch_decision(
+                needs_watch,
+                pre_poll_snapshot.as_ref(),
+                post_poll_snapshot.as_ref(),
+            );
             // Distinguish auth-required errors from transient errors.
             let notify_auth_error = {
                 let mut state = lock_state();
@@ -8421,8 +8413,8 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     );
                     s.last_poll_ok = false;
                     s.last_error = Some(e);
-                    match auth_watch {
-                        Some((watch_mode, watch_snapshot)) => {
+                    match watch_decision {
+                        AuthWatchDecision::Watch | AuthWatchDecision::WatchAndPollNow => {
                             // Only show the balloon on the first failure so it doesn't spam.
                             if s.retry_count == 0 || s.force_notify_auth_error {
                                 should_notify = true;
@@ -8430,8 +8422,12 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                             s.force_notify_auth_error = false;
                             s.auth_error_paused_polling = true;
                             s.auth_watch_active = true;
-                            s.auth_watch_mode = watch_mode;
-                            s.auth_watch_snapshot = watch_snapshot;
+                            if let (Some(mode), Some(snapshot)) =
+                                (watch_mode, post_poll_snapshot.clone())
+                            {
+                                s.auth_watch_mode = mode;
+                                s.auth_watch_snapshot = snapshot;
+                            }
                             set_widget_failure_placeholders(s, compact_view::Attention::Error);
                             s.retry_count = s.retry_count.saturating_add(1);
                             unsafe {
@@ -8450,7 +8446,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                                 );
                             }
                         }
-                        _ => {
+                        AuthWatchDecision::Stop => {
                             s.force_notify_auth_error = false;
                             s.auth_error_paused_polling = false;
                             s.auth_watch_active = false;
@@ -8495,6 +8491,14 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 }
                 should_notify
             };
+
+            // Outside the lock: request_poll takes it. This failure was
+            // decided against credentials that changed mid-poll, so re-poll
+            // instead of pausing on a verdict that is already stale.
+            if watch_decision == AuthWatchDecision::WatchAndPollNow {
+                diagnose::log("credentials changed while polling; polling again");
+                request_poll();
+            }
 
             if notify_auth_error {
                 let balloon = {
@@ -10407,28 +10411,79 @@ mod reset_notification_tests {
     #[test]
     fn credential_watch_mode_tracks_the_only_enabled_provider() {
         assert_eq!(
-            credential_watch_mode_for_failure(poller::PollError::AuthRequired, false, true, false,),
+            credential_watch_mode_for_shown(false, true, false),
             Some(poller::CredentialWatchMode::Codex)
         );
         assert_eq!(
-            credential_watch_mode_for_failure(poller::PollError::AuthRequired, false, false, true,),
+            credential_watch_mode_for_shown(false, false, true),
             Some(poller::CredentialWatchMode::Antigravity)
         );
+        // Claude-only used to widen to AllSources on NoCredentials; that is
+        // now redundant because ActiveSource already falls back to every
+        // known source when no credentials are found.
         assert_eq!(
-            credential_watch_mode_for_failure(poller::PollError::NoCredentials, true, false, false,),
-            Some(poller::CredentialWatchMode::AllSources)
+            credential_watch_mode_for_shown(true, false, false),
+            Some(poller::CredentialWatchMode::ActiveSource)
         );
+        assert!(poll_error_needs_credential_watch(
+            poller::PollError::NoCredentials
+        ));
     }
 
     #[test]
     fn credential_watch_mode_uses_all_providers_for_combined_auth_failure() {
         assert_eq!(
-            credential_watch_mode_for_failure(poller::PollError::TokenExpired, true, true, true,),
+            credential_watch_mode_for_shown(true, true, true),
             Some(poller::CredentialWatchMode::AllProviders)
         );
+        assert!(poll_error_needs_credential_watch(
+            poller::PollError::TokenExpired
+        ));
+        // A network blip is not something signing in would fix.
+        assert!(!poll_error_needs_credential_watch(
+            poller::PollError::RequestFailed
+        ));
+    }
+
+    #[test]
+    fn failure_branch_polls_again_when_credentials_change_while_a_poll_is_in_flight() {
+        let before: poller::CredentialWatchSnapshot = vec!["win:claude|present|10|1".to_string()];
+        let after: poller::CredentialWatchSnapshot = vec!["win:claude|present|10|2".to_string()];
+
+        // The every-provider-failed branch pauses polling, so the watch is
+        // its only way back. Drive that branch's inputs the way do_poll does:
+        // the error decides whether to watch, and the pre/post samples decide
+        // whether this verdict is already stale.
+        for error in [
+            poller::PollError::AuthRequired,
+            poller::PollError::TokenExpired,
+            poller::PollError::NoCredentials,
+        ] {
+            let needs_watch = poll_error_needs_credential_watch(error);
+
+            // Steady state: pause and watch from this baseline.
+            assert_eq!(
+                auth_watch_decision(needs_watch, Some(&before), Some(&before)),
+                AuthWatchDecision::Watch,
+                "{error:?}"
+            );
+
+            // Refreshed while the poll was in flight: pausing on this verdict
+            // would strand the widget until the next interval, because the
+            // baseline already holds the refreshed signature.
+            assert_eq!(
+                auth_watch_decision(needs_watch, Some(&before), Some(&after)),
+                AuthWatchDecision::WatchAndPollNow,
+                "{error:?}"
+            );
+        }
+
+        // Transient failures neither pause nor watch, however the
+        // credentials moved.
+        let needs_watch = poll_error_needs_credential_watch(poller::PollError::RequestFailed);
         assert_eq!(
-            credential_watch_mode_for_failure(poller::PollError::RequestFailed, true, true, true,),
-            None
+            auth_watch_decision(needs_watch, Some(&before), Some(&after)),
+            AuthWatchDecision::Stop
         );
     }
 

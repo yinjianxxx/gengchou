@@ -57,7 +57,6 @@ pub struct PollFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
     ActiveSource,
-    AllSources,
     Codex,
     Antigravity,
     AllProviders,
@@ -771,7 +770,6 @@ fn build_agent_with_timeout(timeout: Duration) -> Result<ureq::Agent, PollError>
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     let mut snapshot = match mode {
         CredentialWatchMode::ActiveSource => claude_credential_watch_snapshot(true),
-        CredentialWatchMode::AllSources => claude_credential_watch_snapshot(false),
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
         CredentialWatchMode::AllProviders => {
