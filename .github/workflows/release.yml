@@ -19,6 +19,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check retired identity allowlist
+        shell: pwsh
+        run: .\tools\check-retired-identity.ps1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
@@ -58,25 +62,10 @@ jobs:
       - name: Build updater helper test binary
         run: cargo build --locked
 
-      - name: Test legacy updater inbound bridge
+      - name: Test current updater inbound readiness
         shell: pwsh
         timeout-minutes: 1
-        run: .\tests\legacy_updater_inbound_e2e.ps1
-
-      - name: Test released v2.2.3 updater bridge and rollback
-        shell: pwsh
-        timeout-minutes: 3
-        run: .\tests\v2.2.3_updater_bridge_e2e.ps1 -AllowRealUserProfileWrite
-
-      - name: Test released v2.2.3 helper with the actual v2.2.4 application
-        shell: pwsh
-        timeout-minutes: 3
-        run: .\tests\v2.2.3_to_v2.2.4_real_e2e.ps1 -AllowInteractiveDesktopAndRealProfileWrite
-
-      - name: Test identity migration state machine
-        shell: pwsh
-        timeout-minutes: 1
-        run: .\tests\migration_e2e.ps1
+        run: .\tests\update_ready_inbound_e2e.ps1
 
       - name: Test updater helper success hand-off
         shell: pwsh
@@ -96,38 +85,23 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           Copy-Item -LiteralPath target\release\gengchou.exe -Destination dist\gengchou.exe
-          Copy-Item -LiteralPath target\release\gengchou.exe -Destination dist\ai-usage-monitor.exe
           Copy-Item -LiteralPath LICENSE -Destination dist\LICENSE
           Copy-Item -LiteralPath THIRD_PARTY_NOTICES.md -Destination dist\THIRD_PARTY_NOTICES.md
           Copy-Item -LiteralPath DEPENDENCY_LICENSES.md -Destination dist\DEPENDENCY_LICENSES.md
           Copy-Item -LiteralPath README.md -Destination dist\README.md
           Copy-Item -LiteralPath README.zh-CN.md -Destination dist\README.zh-CN.md
           Copy-Item -LiteralPath PROVENANCE.md -Destination dist\PROVENANCE.md
-          Copy-Item -LiteralPath tools\verify-v2.2.4-migration.ps1 -Destination dist\verify-v2.2.4-migration.ps1
 
-          $newBundleFiles = @(
+          $bundleFiles = @(
             "dist\gengchou.exe",
             "dist\LICENSE",
             "dist\THIRD_PARTY_NOTICES.md",
             "dist\DEPENDENCY_LICENSES.md",
             "dist\README.md",
             "dist\README.zh-CN.md",
-            "dist\PROVENANCE.md",
-            "dist\verify-v2.2.4-migration.ps1"
+            "dist\PROVENANCE.md"
           )
-          Compress-Archive -LiteralPath $newBundleFiles -DestinationPath dist\gengchou-windows-x64.zip -Force
-
-          $legacyBundleFiles = @(
-            "dist\ai-usage-monitor.exe",
-            "dist\LICENSE",
-            "dist\THIRD_PARTY_NOTICES.md",
-            "dist\DEPENDENCY_LICENSES.md",
-            "dist\README.md",
-            "dist\README.zh-CN.md",
-            "dist\PROVENANCE.md",
-            "dist\verify-v2.2.4-migration.ps1"
-          )
-          Compress-Archive -LiteralPath $legacyBundleFiles -DestinationPath dist\ai-usage-monitor-windows-x64.zip -Force
+          Compress-Archive -LiteralPath $bundleFiles -DestinationPath dist\gengchou-windows-x64.zip -Force
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $requiredCommonEntries = @(
@@ -136,39 +110,30 @@ jobs:
             'DEPENDENCY_LICENSES.md',
             'README.md',
             'README.zh-CN.md',
-            'PROVENANCE.md',
-            'verify-v2.2.4-migration.ps1'
+            'PROVENANCE.md'
           )
-          $bundles = @(
-            @{ Path = 'dist\gengchou-windows-x64.zip'; Exe = 'gengchou.exe' },
-            @{ Path = 'dist\ai-usage-monitor-windows-x64.zip'; Exe = 'ai-usage-monitor.exe' }
+          $bundle = @{ Path = 'dist\gengchou-windows-x64.zip'; Exe = 'gengchou.exe' }
+          $archive = [System.IO.Compression.ZipFile]::OpenRead(
+            (Resolve-Path -LiteralPath $bundle.Path)
           )
-          foreach ($bundle in $bundles) {
-            $archive = [System.IO.Compression.ZipFile]::OpenRead(
-              (Resolve-Path -LiteralPath $bundle.Path)
-            )
-            try {
-              $bundleEntries = @($archive.Entries | ForEach-Object { $_.FullName })
-              foreach ($requiredEntry in @($bundle.Exe) + $requiredCommonEntries) {
-                if ($requiredEntry -notin $bundleEntries) {
-                  throw ('Release bundle {0} is missing required entry: {1}' -f $bundle.Path, $requiredEntry)
-                }
-              }
-              if ($bundleEntries.Count -ne 8) {
-                throw ('Release bundle {0} has {1} entries; expected exactly 8.' -f $bundle.Path, $bundleEntries.Count)
+          try {
+            $bundleEntries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($requiredEntry in @($bundle.Exe) + $requiredCommonEntries) {
+              if ($requiredEntry -notin $bundleEntries) {
+                throw ('Release bundle {0} is missing required entry: {1}' -f $bundle.Path, $requiredEntry)
               }
             }
-            finally {
-              $archive.Dispose()
+            if ($bundleEntries.Count -ne 7) {
+              throw ('Release bundle {0} has {1} entries; expected exactly 7.' -f $bundle.Path, $bundleEntries.Count)
             }
+          }
+          finally {
+            $archive.Dispose()
           }
 
           $assetNames = @(
             "gengchou.exe",
             "gengchou-windows-x64.zip",
-            "ai-usage-monitor.exe",
-            "ai-usage-monitor-windows-x64.zip",
-            "verify-v2.2.4-migration.ps1",
             "LICENSE",
             "THIRD_PARTY_NOTICES.md",
             "DEPENDENCY_LICENSES.md"
@@ -186,8 +151,6 @@ jobs:
           subject-path: |
             dist/gengchou.exe
             dist/gengchou-windows-x64.zip
-            dist/ai-usage-monitor.exe
-            dist/ai-usage-monitor-windows-x64.zip
 
       - name: Create and verify draft GitHub release
         shell: pwsh
@@ -207,9 +170,6 @@ jobs:
           gh release create $env:GITHUB_REF_NAME `
             dist/gengchou.exe `
             dist/gengchou-windows-x64.zip `
-            dist/ai-usage-monitor.exe `
-            dist/ai-usage-monitor-windows-x64.zip `
-            dist/verify-v2.2.4-migration.ps1 `
             dist/LICENSE `
             dist/THIRD_PARTY_NOTICES.md `
             dist/DEPENDENCY_LICENSES.md `
@@ -242,9 +202,6 @@ jobs:
           $requiredVerifiedAssets = @(
             'gengchou.exe',
             'gengchou-windows-x64.zip',
-            'ai-usage-monitor.exe',
-            'ai-usage-monitor-windows-x64.zip',
-            'verify-v2.2.4-migration.ps1',
             'LICENSE',
             'THIRD_PARTY_NOTICES.md',
             'DEPENDENCY_LICENSES.md'
@@ -272,10 +229,6 @@ jobs:
           gh attestation verify release-verify\gengchou.exe --repo $env:GH_REPO
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh attestation verify release-verify\gengchou-windows-x64.zip --repo $env:GH_REPO
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          gh attestation verify release-verify\ai-usage-monitor.exe --repo $env:GH_REPO
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          gh attestation verify release-verify\ai-usage-monitor-windows-x64.zip --repo $env:GH_REPO
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           gh release edit $env:GITHUB_REF_NAME --draft=false

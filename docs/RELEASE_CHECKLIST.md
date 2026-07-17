@@ -9,10 +9,8 @@ with a short note in the release runbook.
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --locked`
-- legacy updater inbound bridge E2E
-- pinned released-v2.2.3 updater component E2E in an isolated Windows profile:
-  successful replacement and rollback; pass `-AllowRealUserProfileWrite`
-- identity migration state-machine E2E
+- `tools\check-retired-identity.ps1`
+- current updater inbound readiness E2E
 - updater helper E2E: `Success` and `ChildExit`
 - `cargo build --release --locked`
 - Confirm the built file is `target/release/gengchou.exe`; inspect PE properties
@@ -103,30 +101,30 @@ with a short note in the release runbook.
 - Verify a portable update releases the old PID and single-instance mutex,
   replaces the target, starts one new PID, and preserves the rollback backup
   until the new process reports ready.
-- As a separate tag-blocking integration test, update a v2.2.3 copy through
-  the real helper into the actual v2.2.4 application. Confirm the first launch
-  preserves old settings and cache, writes `ready_seen`, uses the new runtime
-  window classes, and holds both bridge mutexes without creating two resident
-  processes. On an interactive Windows desktop with Gengchou closed, run
-  `tests\v2.2.3_to_v2.2.4_real_e2e.ps1 -AllowInteractiveDesktopAndRealProfileWrite`.
-- Exit and start v2.2.4 once more. Place the release `SHA256SUMS` beside the
-  verifier and run
-  `tools\verify-v2.2.4-migration.ps1 -RequireMigratedSource -RequireOfficialHash`
-  for an upgraded installation (omit `-RequireMigratedSource` only for a clean
-  v2.2.4 installation);
-  require a clean PASS with state
-  `complete`, valid new settings, no old data directories or Run values, and
-  no unknown-file/reparse-point exception.
-- Confirm the draft release has exactly nine attachments: new and legacy EXE
-  and ZIP names, the migration verifier, three compliance files, and
-  `SHA256SUMS`. The manifest must cover all eight payload assets, and all four
-  EXE/ZIP assets must have build provenance attestations.
+- For the v2.3.0 tag only, confirm every supported older installation has run
+  v2.2.4 twice and passed the official migration verifier. Record the result
+  outside the repository before creating the tag.
+- Confirm the draft release has exactly six attachments: `gengchou.exe`,
+  `gengchou-windows-x64.zip`, three compliance files, and `SHA256SUMS`. The
+  manifest must cover all five payload assets, and the EXE and ZIP must both
+  have build provenance attestations.
 - Verify the WinGet path with `yinjianxxx.Gengchou` on an installed build when
   the new package update exists; do not test the unpublished former ID.
 - Confirm the draft release re-download passes `SHA256SUMS` and GitHub
   attestation verification before the workflow publishes it.
-- Confirm release notes mention any one-time migration, including notification
-  icon placement changes.
-- Do not publish v2.3.0 until every supported pre-v2.2.4 installation has run
-  v2.2.4 twice and passed the verifier; release availability alone does not
-  satisfy the gate.
+- Confirm release notes describe user-visible changes and any required upgrade
+  order without reintroducing retired asset names.
+- Confirm the GitHub About description and topics contain only the current
+  product identity. Preserve the renamed repository redirect, historical
+  releases, tags, and git history.
+
+## Post-release WinGet hand-off
+
+- Publish and re-download the final GitHub release before preparing any WinGet
+  manifest; use the public `gengchou-windows-x64.zip` URL and its released
+  SHA-256, never a draft or local build.
+- Submit the first `yinjianxxx.Gengchou` package only after the matching GitHub
+  release is public, then wait for the WinGet validation pipeline and review.
+- After the WinGet pull request is merged, install the public package on a
+  clean Windows profile, confirm the installed command is `gengchou`, and test
+  launch, update detection, and uninstall.
