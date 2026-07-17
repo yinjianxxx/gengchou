@@ -10,10 +10,19 @@ pub const APP_DIR_NAME: &str = "AIUsageMonitor";
 const LEGACY_APP_DIR_NAME: &str = "ClaudeCodexUsageMonitor";
 
 pub const POLL_1_MIN: u32 = 60_000;
+pub const POLL_2_MIN: u32 = 120_000;
 pub const POLL_5_MIN: u32 = 300_000;
+pub const POLL_10_MIN: u32 = 600_000;
 pub const POLL_15_MIN: u32 = 900_000;
-pub const POLL_1_HOUR: u32 = 3_600_000;
-const SUPPORTED_POLL_INTERVALS: [u32; 4] = [POLL_1_MIN, POLL_5_MIN, POLL_15_MIN, POLL_1_HOUR];
+pub const POLL_30_MIN: u32 = 1_800_000;
+const SUPPORTED_POLL_INTERVALS: [u32; 6] = [
+    POLL_1_MIN,
+    POLL_2_MIN,
+    POLL_5_MIN,
+    POLL_10_MIN,
+    POLL_15_MIN,
+    POLL_30_MIN,
+];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SettingsFile {
@@ -83,7 +92,7 @@ pub fn default_provider_order() -> Vec<TrayIconKind> {
 }
 
 fn default_poll_interval() -> u32 {
-    POLL_15_MIN
+    POLL_5_MIN
 }
 
 fn default_widget_visible() -> bool {
@@ -278,7 +287,7 @@ mod tests {
         let repaired = normalize(&mut settings);
 
         assert_eq!(settings.tray_offset, 0);
-        assert_eq!(settings.poll_interval_ms, POLL_15_MIN);
+        assert_eq!(settings.poll_interval_ms, POLL_5_MIN);
         assert_eq!(settings.language, None);
         assert!(settings.show_claude_code);
         assert_eq!(
@@ -290,6 +299,32 @@ mod tests {
             ]
         );
         assert_eq!(repaired.len(), 5);
+    }
+
+    #[test]
+    fn all_refresh_menu_intervals_are_preserved() {
+        for poll_interval_ms in SUPPORTED_POLL_INTERVALS {
+            let mut settings = SettingsFile {
+                poll_interval_ms,
+                ..SettingsFile::default()
+            };
+
+            assert!(!normalize(&mut settings).contains(&"poll_interval_ms"));
+            assert_eq!(settings.poll_interval_ms, poll_interval_ms);
+        }
+    }
+
+    #[test]
+    fn removed_one_hour_interval_migrates_to_five_minute_default() {
+        let mut settings = SettingsFile {
+            poll_interval_ms: 60 * 60 * 1_000,
+            ..SettingsFile::default()
+        };
+
+        let repaired = normalize(&mut settings);
+
+        assert_eq!(settings.poll_interval_ms, POLL_5_MIN);
+        assert_eq!(repaired, vec!["poll_interval_ms"]);
     }
 
     #[test]

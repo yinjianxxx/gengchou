@@ -41,7 +41,8 @@ use crate::native_interop::{
 };
 use crate::poller;
 use crate::settings::{
-    self, default_provider_order, SettingsFile, POLL_15_MIN, POLL_1_HOUR, POLL_1_MIN, POLL_5_MIN,
+    self, default_provider_order, SettingsFile, POLL_10_MIN, POLL_15_MIN, POLL_1_MIN, POLL_2_MIN,
+    POLL_30_MIN, POLL_5_MIN,
 };
 use crate::theme;
 use crate::tray_icon;
@@ -178,14 +179,16 @@ enum UpdateStatus {
 const RETRY_BASE_MS: u32 = 30_000; // 30 seconds
 
 const RATE_LIMIT_MIN_RETRY_MS: u32 = POLL_5_MIN;
-const RATE_LIMIT_MAX_RETRY_MS: u32 = POLL_1_HOUR;
+const RATE_LIMIT_MAX_RETRY_MS: u32 = 60 * 60 * 1_000;
 
 const IDM_REFRESH_NOW: u16 = 1;
 // Menu item IDs for update frequency
 const IDM_FREQ_1MIN: u16 = 10;
 const IDM_FREQ_5MIN: u16 = 11;
 const IDM_FREQ_15MIN: u16 = 12;
-const IDM_FREQ_1HOUR: u16 = 13;
+const IDM_FREQ_2MIN: u16 = 14;
+const IDM_FREQ_10MIN: u16 = 15;
+const IDM_FREQ_30MIN: u16 = 16;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
@@ -7919,7 +7922,7 @@ pub fn run() {
             state
                 .as_ref()
                 .map(|s| s.poll_interval_ms)
-                .unwrap_or(POLL_15_MIN)
+                .unwrap_or(POLL_5_MIN)
         };
         SetTimer(poll_controller_hwnd(), TIMER_POLL, initial_poll_ms, None);
 
@@ -9292,13 +9295,16 @@ unsafe fn wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
                 }
-                IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
+                IDM_FREQ_1MIN | IDM_FREQ_2MIN | IDM_FREQ_5MIN | IDM_FREQ_10MIN | IDM_FREQ_15MIN
+                | IDM_FREQ_30MIN => {
                     let new_interval = match id {
                         IDM_FREQ_1MIN => POLL_1_MIN,
+                        IDM_FREQ_2MIN => POLL_2_MIN,
                         IDM_FREQ_5MIN => POLL_5_MIN,
+                        IDM_FREQ_10MIN => POLL_10_MIN,
                         IDM_FREQ_15MIN => POLL_15_MIN,
-                        IDM_FREQ_1HOUR => POLL_1_HOUR,
-                        _ => POLL_15_MIN,
+                        IDM_FREQ_30MIN => POLL_30_MIN,
+                        _ => POLL_5_MIN,
                     };
                     {
                         let mut state = lock_state();
@@ -9525,7 +9531,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.notify_weekly_reset,
                 ),
                 None => (
-                    POLL_15_MIN,
+                    POLL_5_MIN,
                     LanguageId::English.strings(),
                     LanguageId::English,
                     None,
@@ -9564,11 +9570,13 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(refresh_now.as_ptr()),
         );
         let _ = AppendMenuW(refresh_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let freq_items: [(u16, u32, &str); 4] = [
+        let freq_items: [(u16, u32, &str); 6] = [
             (IDM_FREQ_1MIN, POLL_1_MIN, strings.one_minute),
+            (IDM_FREQ_2MIN, POLL_2_MIN, strings.two_minutes),
             (IDM_FREQ_5MIN, POLL_5_MIN, strings.five_minutes),
+            (IDM_FREQ_10MIN, POLL_10_MIN, strings.ten_minutes),
             (IDM_FREQ_15MIN, POLL_15_MIN, strings.fifteen_minutes),
-            (IDM_FREQ_1HOUR, POLL_1_HOUR, strings.one_hour),
+            (IDM_FREQ_30MIN, POLL_30_MIN, strings.thirty_minutes),
         ];
         for (id, interval, label) in freq_items {
             let label_str = native_interop::wide_str(label);
@@ -10594,7 +10602,10 @@ mod reset_notification_tests {
     fn compact_window_labels_stay_english_in_every_ui_language() {
         let five_hours = UsageWindow::new(0.0, None, Some(FIVE_HOURS_SECONDS));
         let seven_days = UsageWindow::new(0.0, None, Some(ONE_WEEK_SECONDS));
+        let thirty_days = UsageWindow::new(0.0, None, Some(30 * 24 * 60 * 60));
         let thirty_minutes = UsageWindow::new(0.0, None, Some(30 * 60));
+        let unknown =
+            UsageWindow::new(0.0, None, None).with_source_label(Some("Primary".to_string()));
         let strings = LanguageId::Korean.strings();
 
         assert_eq!(
@@ -10606,10 +10617,20 @@ mod reset_notification_tests {
             "7d"
         );
         assert_eq!(
+            compact_view::compact_usage_window_label(&thirty_days, strings),
+            "30d"
+        );
+        assert_eq!(
             compact_view::compact_usage_window_label(&thirty_minutes, strings),
             "30m"
         );
+        assert_eq!(
+            compact_view::compact_usage_window_label(&unknown, strings),
+            "Primary"
+        );
         assert_eq!(usage_window_label(&five_hours, strings), "5시간");
+        assert_eq!(usage_window_label(&thirty_days, strings), "30d");
+        assert_eq!(usage_window_label(&unknown, strings), "Primary");
     }
 
     #[test]
