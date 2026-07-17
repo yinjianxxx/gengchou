@@ -9,7 +9,7 @@
 
 **AI quota at a glance.**
 
-<sub>AI usage monitor for the Windows taskbar</sub>
+<sub>AI quota monitor for the Windows taskbar</sub>
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![CI](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml)
@@ -82,25 +82,24 @@ other way around:
 
 Installation options, in recommended order:
 
-1. **WinGet (preferred when available).** Gengchou uses a new package
-   identity; the former AI Usage Monitor package was never published to
-   WinGet. Once the new package is available, install it with:
-
-   ```powershell
-   winget install --id yinjianxxx.Gengchou --exact
-   ```
-
-   If WinGet does not find `yinjianxxx.Gengchou` yet, use the ZIP below.
-
-2. **Portable ZIP (recommended manual download).** Download
+1. **Portable ZIP (recommended).** Download
    `gengchou-windows-x64.zip` from the
    [latest release](https://github.com/yinjianxxx/gengchou/releases/latest),
    extract it to any folder you can write to, and run `gengchou.exe`. The
    bundle includes both READMEs and the retained license and attribution
    notices.
 
-3. **Standalone EXE.** For a single-file download, get `gengchou.exe` from
+2. **Standalone EXE.** For a single-file download, get `gengchou.exe` from
    the same release and run it from any writable folder.
+
+3. **WinGet (planned for v2.3.0).** The package will use the new identity
+   below after the controlled internal migration is complete:
+
+   ```powershell
+   winget install --id yinjianxxx.Gengchou --exact
+   ```
+
+   Until that package is published, use the ZIP or EXE instead.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
 download verification, and self-updates check it automatically. Starting with
@@ -164,17 +163,32 @@ each provider's own account rules:
 
 | What | Where |
 | --- | --- |
-| Settings | `%APPDATA%\AIUsageMonitor\settings.json` |
-| Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\AIUsageMonitor\usage-cache.json` |
-| Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\AIUsageMonitor\diagnose.log` |
+| Settings | `%APPDATA%\Gengchou\settings.json` |
+| Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
+| Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
-The legacy `AIUsageMonitor` directory name is intentionally retained so an
-upgrade to Gengchou keeps existing settings, cache, diagnostics, and startup
-behavior without migration.
+v2.2.4 is the one-time migration bridge. Its first healthy launch verifies and
+copies settings and a fresh usage cache to the paths above, moves the Start
+with Windows entry, and leaves the source files untouched. Exit Gengchou and
+start it once more; the second launch removes only the known files owned by
+this project. Data belonging to the original CodeZeno app may be read only as
+a settings fallback and is never deleted. If unknown files or reparse points
+remain, monitoring still works, but cleanup stays pending and updates remain
+disabled. Update checks stay off until cleanup completes, so the bridge cannot
+be skipped accidentally.
+
+After upgrading from an earlier version and completing the second launch,
+place `verify-v2.2.4-migration.ps1` beside the release `SHA256SUMS`, then run
+`verify-v2.2.4-migration.ps1 -RequireMigratedSource -RequireOfficialHash`.
+For a clean v2.2.4 installation with no earlier settings, omit
+`-RequireMigratedSource`.
+It checks the official binary hash, running version, migration state, settings,
+startup entry, runtime identity, and the absence of this project's old data
+directories. The old diagnostic log is not copied; v2.2.4 starts a new one
+under the Gengchou path.
 
 To uninstall: disable **Start with Windows** if you enabled it, then delete
-the executable, `%APPDATA%\AIUsageMonitor`, and
-`%LOCALAPPDATA%\AIUsageMonitor`.
+the executable, `%APPDATA%\Gengchou`, and `%LOCALAPPDATA%\Gengchou`.
 
 Network traffic goes directly to the enabled providers (Anthropic,
 ChatGPT/Codex, Google) for read-only usage queries, plus GitHub for update

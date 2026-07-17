@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Gengchou (formerly AI Usage Monitor) contains modified material from, or was informed by, the
+Gengchou contains modified material from, or was informed by, the
 following open-source projects.
 
 ## CodeZeno/Claude-Code-Usage-Monitor

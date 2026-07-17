@@ -7,8 +7,9 @@ Microsoft Remote Desktop transitions and explorer.exe taskbar rebuilds without
 crashing or permanently losing the embedded widget; it has since developed
 independently. The independent project was initially released as AI Usage
 Monitor and adopted the Gengchou name on the 2.2.x line. The rename changes
-the public product identity while deliberately retaining internal Windows
-identity values so existing installations continue to use the same data.
+the public product identity. v2.2.4 is the controlled bridge that moves the
+remaining internal Windows identity and user data to Gengchou; v2.3.0 removes
+the bridge after all supported installations have completed it.
 
 ## Relationship to the original project
 
@@ -23,12 +24,12 @@ identity values so existing installations continue to use the same data.
 |---|---|---|
 | Package and EXE | claude-code-usage-monitor | gengchou |
 | Version line | 1.4.x | 2.x |
-| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\AIUsageMonitor (retained) |
-| Window class | ClaudeCodeUsageMonitor | AIUsageMonitor (retained) |
-| Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\AIUsageMonitor (retained) |
-| Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\AIUsageMonitor\diagnose.log (retained) |
+| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\Gengchou; v2.2.4 also holds Global\AIUsageMonitor during the bridge |
+| Window class | ClaudeCodeUsageMonitor | Gengchou |
+| Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\Gengchou |
+| Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\Gengchou\diagnose.log |
 | Updates | Upstream GitHub Releases | Gengchou GitHub Releases and independent EXE asset |
-| Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\AIUsageMonitor\updates (retained) |
+| Update staging directory | %LOCALAPPDATA%\ClaudeCodeUsageMonitor\updates | %LOCALAPPDATA%\Gengchou\updates |
 
 ## Stability changes
 
