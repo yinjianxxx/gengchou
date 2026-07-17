@@ -28,6 +28,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const CODEX_REQUEST_TIMEOUT_SECS: u64 = 10;
 const CODEX_RETRY_DELAY_MS: u64 = 1_000;
 const ANTIGRAVITY_REQUEST_TIMEOUT_SECS: u64 = 10;
+const ANTIGRAVITY_FIVE_HOUR_RESET_GRACE_SECS: u64 = 15 * 60;
 const AUTH_REJECTION_RECHECK_SECS: u64 = 15 * 60;
 const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
@@ -131,6 +132,7 @@ struct CodexRateLimitDetails {
 #[derive(Deserialize)]
 struct CodexRateLimitWindow {
     used_percent: Option<f64>,
+    /// Provider-defined rolling window; do not infer it from the ChatGPT plan.
     limit_window_seconds: Option<u64>,
     reset_at: Option<i64>,
 }
@@ -1409,6 +1411,13 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageWi
 }
 
 fn antigravity_usage_from_user_quota(response: AntigravityUserQuotaResponse) -> Option<UsageData> {
+    antigravity_usage_from_user_quota_at(response, SystemTime::now())
+}
+
+fn antigravity_usage_from_user_quota_at(
+    response: AntigravityUserQuotaResponse,
+    now: SystemTime,
+) -> Option<UsageData> {
     let window = best_antigravity_section(response.buckets.into_iter().filter_map(|bucket| {
         if bucket.disabled.unwrap_or(false) {
             return None;
@@ -1419,9 +1428,13 @@ fn antigravity_usage_from_user_quota(response: AntigravityUserQuotaResponse) -> 
             return None;
         }
         let remaining = bucket.remaining_fraction?.clamp(0.0, 1.0);
+        let resets_at = parse_iso8601(bucket.reset_time.as_deref())?;
+        if !is_plausible_antigravity_five_hour_reset(resets_at, now) {
+            return None;
+        }
         Some(UsageWindow::new(
             (1.0 - remaining) * 100.0,
-            parse_iso8601(bucket.reset_time.as_deref()),
+            Some(resets_at),
             Some(FIVE_HOURS_SECONDS),
         ))
     }))?;
@@ -1429,16 +1442,39 @@ fn antigravity_usage_from_user_quota(response: AntigravityUserQuotaResponse) -> 
     Some(UsageData::from_windows(vec![window]))
 }
 
+fn is_plausible_antigravity_five_hour_reset(resets_at: SystemTime, now: SystemTime) -> bool {
+    let Ok(remaining) = resets_at.duration_since(now) else {
+        return false;
+    };
+    !remaining.is_zero()
+        && remaining
+            <= Duration::from_secs(FIVE_HOURS_SECONDS + ANTIGRAVITY_FIVE_HOUR_RESET_GRACE_SECS)
+}
+
 fn merge_antigravity_usage_sources(
     per_model: Option<UsageData>,
     summary: Option<UsageData>,
 ) -> Option<UsageData> {
-    let mut windows = Vec::new();
-    for usage in [per_model, summary].into_iter().flatten() {
-        for window in usage.windows {
-            upsert_usage_window(&mut windows, window);
+    let mut windows = summary.map(|usage| usage.windows).unwrap_or_default();
+    let summary_has_five_hour = windows
+        .iter()
+        .any(|window| window.duration_seconds == Some(FIVE_HOURS_SECONDS));
+
+    if !summary_has_five_hour {
+        for candidate in per_model
+            .into_iter()
+            .flat_map(|usage| usage.windows.into_iter())
+        {
+            let duplicates_summary = windows.iter().any(|window| {
+                (window.percentage - candidate.percentage).abs() < 0.000_001
+                    && window.resets_at == candidate.resets_at
+            });
+            if !duplicates_summary {
+                upsert_usage_window(&mut windows, candidate);
+            }
         }
     }
+
     (!windows.is_empty()).then(|| UsageData::from_windows(windows))
 }
 
@@ -1467,6 +1503,18 @@ fn antigravity_section_from_summary_bucket(
 fn antigravity_summary_bucket_duration_seconds(
     bucket: &AntigravityQuotaSummaryBucket,
 ) -> Option<u64> {
+    match bucket
+        .bucket_id
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("gemini-5h" | "3p-5h") => return Some(FIVE_HOURS_SECONDS),
+        Some("gemini-weekly" | "3p-weekly") => return Some(ONE_WEEK_SECONDS),
+        _ => {}
+    }
+
     if let Some(seconds) = usage_window_duration_seconds(bucket.window.as_deref()) {
         return Some(seconds);
     }
@@ -2669,6 +2717,32 @@ mod tests {
     }
 
     #[test]
+    fn codex_provider_defined_thirty_day_window_is_preserved_without_plan_assumptions() {
+        let response: CodexUsageResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 17,
+                        "limit_window_seconds": 2592000,
+                        "reset_at": 1786464000
+                    },
+                    "secondary_window": null
+                }
+            }"#,
+        )
+        .expect("Codex response should deserialize");
+
+        let usage = codex_usage_from_response(response).expect("rate limit should be present");
+
+        assert_eq!(usage.windows.len(), 1);
+        assert_eq!(usage.windows[0].percentage, 17.0);
+        assert_eq!(
+            usage.windows[0].duration_seconds,
+            Some(30 * ONE_DAY_SECONDS)
+        );
+    }
+
+    #[test]
     fn codex_windows_are_ordered_by_duration_instead_of_api_position() {
         let response: CodexUsageResponse = serde_json::from_str(
             r#"{
@@ -2795,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_user_quota_collapses_models_into_the_most_used_five_hour_window() {
+    fn antigravity_user_quota_accepts_only_plausible_five_hour_resets() {
         let response: AntigravityUserQuotaResponse = serde_json::from_str(
             r#"{
                 "buckets": [
@@ -2825,13 +2899,33 @@ mod tests {
         )
         .expect("user quota response should deserialize");
 
-        let usage = antigravity_usage_from_user_quota(response)
+        let now = parse_iso8601(Some("2026-06-13T20:00:00Z")).unwrap();
+        let usage = antigravity_usage_from_user_quota_at(response, now)
             .expect("a supported per-model quota should be selected");
 
         assert_eq!(usage.windows.len(), 1);
         assert_eq!(usage.windows[0].duration_seconds, Some(FIVE_HOURS_SECONDS));
         assert!((usage.windows[0].percentage - 75.0).abs() < f64::EPSILON);
         assert!(usage.windows[0].resets_at.is_some());
+    }
+
+    #[test]
+    fn antigravity_user_quota_rejects_weekly_reset_mislabeled_as_five_hour() {
+        let response: AntigravityUserQuotaResponse = serde_json::from_str(
+            r#"{
+                "buckets": [
+                    {
+                        "modelId": "models/gemini-3.5-flash-high",
+                        "remainingFraction": 0.77,
+                        "resetTime": "2026-06-20T17:08:54Z"
+                    }
+                ]
+            }"#,
+        )
+        .expect("user quota response should deserialize");
+        let now = parse_iso8601(Some("2026-06-13T20:00:00Z")).unwrap();
+
+        assert!(antigravity_usage_from_user_quota_at(response, now).is_none());
     }
 
     #[test]
@@ -2864,7 +2958,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_sources_dedupe_legacy_summary_five_hour_bucket() {
+    fn antigravity_summary_five_hour_bucket_is_authoritative() {
         let per_model =
             UsageData::from_windows(vec![UsageWindow::new(40.0, None, Some(FIVE_HOURS_SECONDS))]);
         let summary = UsageData::from_windows(vec![
@@ -2873,11 +2967,48 @@ mod tests {
         ]);
 
         let merged = merge_antigravity_usage_sources(Some(per_model), Some(summary))
-            .expect("legacy duplicate windows should merge");
+            .expect("summary windows should remain usable");
 
         assert_eq!(merged.windows.len(), 2);
-        assert_eq!(merged.windows[0].percentage, 40.0);
+        assert_eq!(merged.windows[0].percentage, 20.0);
         assert_eq!(merged.windows[1].percentage, 8.0);
+    }
+
+    #[test]
+    fn antigravity_sources_suppress_per_model_duplicate_of_weekly_summary() {
+        let reset = Some(UNIX_EPOCH + Duration::from_secs(1_767_225_600));
+        let per_model = UsageData::from_windows(vec![UsageWindow::new(
+            23.0,
+            reset,
+            Some(FIVE_HOURS_SECONDS),
+        )]);
+        let summary =
+            UsageData::from_windows(vec![UsageWindow::new(23.0, reset, Some(ONE_WEEK_SECONDS))]);
+
+        let merged = merge_antigravity_usage_sources(Some(per_model), Some(summary))
+            .expect("weekly summary should remain usable");
+
+        assert_eq!(merged.windows.len(), 1);
+        assert_eq!(merged.windows[0].duration_seconds, Some(ONE_WEEK_SECONDS));
+    }
+
+    #[test]
+    fn antigravity_sources_keep_equal_usage_with_distinct_reset_times() {
+        let per_model = UsageData::from_windows(vec![UsageWindow::new(
+            23.0,
+            Some(UNIX_EPOCH + Duration::from_secs(1_767_225_600)),
+            Some(FIVE_HOURS_SECONDS),
+        )]);
+        let summary = UsageData::from_windows(vec![UsageWindow::new(
+            23.0,
+            Some(UNIX_EPOCH + Duration::from_secs(1_767_232_800)),
+            Some(ONE_WEEK_SECONDS),
+        )]);
+
+        let merged = merge_antigravity_usage_sources(Some(per_model), Some(summary))
+            .expect("distinct quota windows should remain usable");
+
+        assert_eq!(merged.windows.len(), 2);
     }
 
     #[test]
