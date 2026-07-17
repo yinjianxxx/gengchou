@@ -80,6 +80,10 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Check portable runtime dependencies
+        shell: pwsh
+        run: .\tools\check-portable-runtime.ps1
+
       - name: Prepare release assets
         shell: pwsh
         run: |

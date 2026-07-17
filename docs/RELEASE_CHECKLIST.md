@@ -13,6 +13,8 @@ with a short note in the release runbook.
 - current updater inbound readiness E2E
 - updater helper E2E: `Success` and `ChildExit`
 - `cargo build --release --locked`
+- `tools\check-portable-runtime.ps1` rejects external MSVC/UCRT runtime DLLs
+  so the portable executable starts without a separate redistributable.
 - Confirm the built file is `target/release/gengchou.exe`; inspect PE properties
   for ProductName `Gengchou`, version/tag agreement, retained upstream
   copyright/Comments, and the unchanged v2.1.0 application icon.
