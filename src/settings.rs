@@ -212,15 +212,6 @@ pub(crate) fn load() -> SettingsFile {
     settings
 }
 
-pub(crate) fn normalized_json(content: &str) -> Result<(SettingsFile, String), String> {
-    let mut settings: SettingsFile =
-        serde_json::from_str(content).map_err(|error| format!("invalid settings JSON: {error}"))?;
-    normalize(&mut settings);
-    let json = serde_json::to_string_pretty(&settings)
-        .map_err(|error| format!("unable to serialize normalized settings: {error}"))?;
-    Ok((settings, json))
-}
-
 pub(crate) fn write_file_atomic(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

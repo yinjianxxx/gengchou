@@ -59,13 +59,13 @@
 
 2. **独立 EXE。** 如需单文件下载，可从同一 Release 获取 `gengchou.exe`，放在任意可写目录直接运行。
 
-3. **WinGet（计划从 v2.3.0 开始提供）。** 内部迁移全部完成后，新包将使用以下标识：
+3. **WinGet（上架后可用）。** 软件包使用以下标识：
 
    ```powershell
    winget install --id yinjianxxx.Gengchou --exact
    ```
 
-   新包发布前，请使用 ZIP 或 EXE。
+   如果 WinGet 暂时找不到该软件包，请改用 ZIP 或 EXE。
 
 可执行文件目前未做代码签名。每个 Release 都提供 `SHA256SUMS`，应用内更新也会核对校验值。从 v2.1.0 起，发布资产还带有 GitHub artifact attestation，可用于核验构建来源，但不能替代 Authenticode 签名。
 
@@ -118,9 +118,7 @@ cargo build --release --locked
 | 用量缓存——仅百分比、配额窗口元数据和重置时间，绝不含令牌 | `%APPDATA%\Gengchou\usage-cache.json` |
 | 诊断日志（只追加、自动轮换） | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
-v2.2.4 是一次性迁移版本。第一次正常启动时，它会核对并复制设置和仍然有效的用量缓存，同时迁移开机启动项；旧文件暂时保留。退出更筹，再启动一次，第二次启动会清理由本项目拥有的已知旧文件。CodeZeno 原应用的数据只会在必要时作为设置回退来源读取，绝不会删除。旧目录里如果有不认识的文件或重解析点，应用仍可正常监控，但会保留这些文件并继续停用更新，等待人工核对。迁移完成前，应用不会检查或安装后续版本，以免意外跳过这个桥接步骤。
-
-从旧版本升级并完成第二次启动后，把 Release 中的 `verify-v2.2.4-migration.ps1` 与 `SHA256SUMS` 放在同一目录，再运行 `verify-v2.2.4-migration.ps1 -RequireMigratedSource -RequireOfficialHash`。如果是没有旧设置的 v2.2.4 全新安装，则省略 `-RequireMigratedSource`。脚本会检查官方文件哈希、运行版本、迁移状态、设置、开机启动项、运行时身份和本项目旧数据目录。旧诊断日志不会复制；v2.2.4 会在新目录中重新记录。
+v2.3.0 只读写上表中的更筹路径。仍低于 v2.2.4 的安装必须先保留并运行 v2.2.4 桥接版两次，完成迁移验证后，才能升级到 v2.3.0 或后续版本。
 
 卸载前，如已启用**开机启动**，请先在菜单中关闭，然后删除可执行文件、`%APPDATA%\Gengchou` 和 `%LOCALAPPDATA%\Gengchou` 两个目录。
 

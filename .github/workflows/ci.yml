@@ -23,6 +23,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check retired identity allowlist
+        shell: pwsh
+        run: .\tools\check-retired-identity.ps1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
@@ -41,20 +45,10 @@ jobs:
       - name: Build updater helper test binary
         run: cargo build --locked
 
-      - name: Test legacy updater inbound bridge
+      - name: Test current updater inbound readiness
         shell: pwsh
         timeout-minutes: 1
-        run: .\tests\legacy_updater_inbound_e2e.ps1
-
-      - name: Test released v2.2.3 updater bridge and rollback
-        shell: pwsh
-        timeout-minutes: 3
-        run: .\tests\v2.2.3_updater_bridge_e2e.ps1 -AllowRealUserProfileWrite
-
-      - name: Test identity migration state machine
-        shell: pwsh
-        timeout-minutes: 1
-        run: .\tests\migration_e2e.ps1
+        run: .\tests\update_ready_inbound_e2e.ps1
 
       - name: Test updater helper success hand-off
         shell: pwsh

@@ -4,7 +4,6 @@ mod compact_layout;
 mod compact_view;
 mod diagnose;
 mod localization;
-mod migration;
 mod models;
 mod native_interop;
 mod poller;
@@ -16,10 +15,6 @@ mod window;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    #[cfg(debug_assertions)]
-    let migration_e2e = args.get(1).map(String::as_str) == Some("--migration-e2e-ready");
-    #[cfg(not(debug_assertions))]
-    let migration_e2e = false;
     // Diagnostics are always on (append + rotation, see diagnose.rs); the old
     // --diagnose flag is accepted but no longer required.
     match diagnose::init() {
@@ -88,49 +83,9 @@ fn main() {
     }
 
     let Some(instance_guard) = window::acquire_single_instance() else {
-        if migration_e2e {
-            std::process::exit(1);
-        }
         return;
     };
-    let update_ready_requested = match updater::update_ready_requested() {
-        Ok(requested) => requested,
-        Err(error) => {
-            diagnose::log(format!("startup blocked before migration: {error}"));
-            if migration_e2e {
-                std::process::exit(1);
-            }
-            migration::show_blocking_error(&error);
-            return;
-        }
-    };
-    let report = match migration::prepare_for_ui(update_ready_requested) {
-        Ok(report) => report,
-        Err(error) => {
-            diagnose::log(format!("startup blocked by identity migration: {error}"));
-            if migration_e2e {
-                std::process::exit(1);
-            }
-            migration::show_blocking_error(&error);
-            return;
-        }
-    };
-    let updates_allowed = report.updates_allowed;
-    for message in report.messages {
-        diagnose::log(message);
-    }
-    if migration_e2e {
-        let exit_code = match migration::mark_ready_seen() {
-            Ok(()) => 0,
-            Err(error) => {
-                diagnose::log(format!("migration E2E readiness failed: {error}"));
-                1
-            }
-        };
-        drop(instance_guard);
-        std::process::exit(exit_code);
-    }
 
     diagnose::log("entering window::run");
-    window::run(instance_guard, updates_allowed);
+    window::run(instance_guard);
 }

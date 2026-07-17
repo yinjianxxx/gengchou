@@ -34,7 +34,6 @@ use crate::compact_layout::{self, BadgeHit, ColorKey, DrawCmd, FontKey, Metrics,
 use crate::compact_view::{self, CompactViewModel};
 use crate::diagnose;
 use crate::localization::{self, LanguageId, Strings};
-use crate::migration;
 use crate::models::{
     AppUsageData, ProviderStatus, UsageData, UsageWindow, FIVE_HOURS_SECONDS, ONE_WEEK_SECONDS,
 };
@@ -402,9 +401,6 @@ fn watchdog_needs_taskbar_recovery(
 /// UI thread id, so the watchdog can reach the message loop once the window
 /// (the usual PostMessage target) no longer exists.
 static UI_THREAD_ID: AtomicU32 = AtomicU32::new(0);
-/// v2.2.4 must finish its second-start cleanup before it can offer v2.3.0.
-/// Otherwise a later auto-update could skip the bridge's `complete` gate.
-static MIGRATION_UPDATES_ALLOWED: AtomicBool = AtomicBool::new(false);
 
 /// The Win32 window class; also part of the app's identity (kept distinct
 /// from the original CodeZeno app so both can run side by side).
@@ -419,9 +415,7 @@ const WIDGET_TOOLTIP_WINDOW_CLASS_NAME: &str = "GengchouWidgetTooltip";
 /// not reflected until the next poll), and be findable by class name so a
 /// second launched instance can ask us to show the detail popup.
 const BROADCAST_WINDOW_CLASS_NAME: &str = "GengchouBroadcast";
-const LEGACY_BROADCAST_WINDOW_CLASS_NAME: &str = "AIUsageMonitorBroadcast";
 const CURRENT_MUTEX_NAME: &str = "Global\\Gengchou";
-const LEGACY_MUTEX_NAME: &str = "Global\\AIUsageMonitor";
 const DETAIL_POPUP_WIDTH: i32 = 408;
 /// Title area above the first provider group.
 const DETAIL_HEADER_H: i32 = 52;
@@ -581,11 +575,9 @@ const RELAUNCH_BACKOFF_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "GENGCHOU_RELAUNCH";
-const LEGACY_ENV_RELAUNCH: &str = "AIUM_RELAUNCH";
 /// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
 /// the child so it can detect a relaunch storm.
 const ENV_LAST_RELAUNCH_UNIX: &str = "GENGCHOU_LAST_RELAUNCH_UNIX";
-const LEGACY_ENV_LAST_RELAUNCH_UNIX: &str = "AIUM_LAST_RELAUNCH_UNIX";
 
 /// Relaunch the widget as a fresh process. Last-resort recovery only: normal
 /// recovery from explorer restarts and RDP session switches happens in-process
@@ -620,8 +612,6 @@ fn relaunch_self() {
         .args(&args)
         .env(ENV_RELAUNCH, "1")
         .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .env_remove(LEGACY_ENV_RELAUNCH)
-        .env_remove(LEGACY_ENV_LAST_RELAUNCH_UNIX)
         .spawn()
     {
         Ok(_) => {
@@ -2001,7 +1991,7 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
-    if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire) || !updater::update_channel_configured() {
+    if !updater::update_channel_configured() {
         unsafe {
             let _ = KillTimer(hwnd, TIMER_UPDATE_CHECK);
         }
@@ -5839,7 +5829,7 @@ fn version_action_label(
     let current = env!("CARGO_PKG_VERSION");
     // No release channel configured (this project's default): show the plain
     // version instead of a "Check for updates" action that can only fail.
-    if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire) || !updater::update_channel_configured() {
+    if !updater::update_channel_configured() {
         return format!("v{current}");
     }
     match status {
@@ -5864,7 +5854,7 @@ fn version_action_label(
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
-    if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire) || !updater::update_channel_configured() {
+    if !updater::update_channel_configured() {
         return;
     }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
@@ -5953,9 +5943,6 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
 }
 
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
-    if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire) {
-        return;
-    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let (strings, already_in_progress) = {
         let mut state = lock_state();
@@ -6001,9 +5988,6 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
 }
 
 fn begin_winget_update(hwnd: HWND) {
-    if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire) {
-        return;
-    }
     let strings = {
         let state = lock_state();
         state.as_ref().map(|s| s.language.strings())
@@ -7638,54 +7622,33 @@ unsafe fn broadcast_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 pub(crate) struct InstanceGuard {
-    legacy: HANDLE,
-    current: HANDLE,
+    handle: HANDLE,
 }
 
 impl Drop for InstanceGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = ReleaseMutex(self.current);
-            let _ = CloseHandle(self.current);
-            let _ = ReleaseMutex(self.legacy);
-            let _ = CloseHandle(self.legacy);
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
 
 pub(crate) fn acquire_single_instance() -> Option<InstanceGuard> {
-    let is_relaunch =
-        std::env::var(ENV_RELAUNCH).is_ok() || std::env::var(LEGACY_ENV_RELAUNCH).is_ok();
-    let (legacy_name, current_name) = mutex_names();
-    let legacy = acquire_named_mutex(&legacy_name, is_relaunch)?;
-    let current = match acquire_named_mutex(&current_name, is_relaunch) {
-        Some(handle) => handle,
-        None => {
-            unsafe {
-                let _ = ReleaseMutex(legacy);
-                let _ = CloseHandle(legacy);
-            }
-            return None;
-        }
-    };
-    Some(InstanceGuard { legacy, current })
+    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
+    let handle = acquire_named_mutex(&mutex_name(), is_relaunch)?;
+    Some(InstanceGuard { handle })
 }
 
-fn mutex_names() -> (String, String) {
+fn mutex_name() -> String {
     #[cfg(debug_assertions)]
-    if let Some(suffix) = std::env::var_os("GENGCHOU_MIGRATION_TEST_MUTEX_SUFFIX") {
+    if let Some(suffix) = std::env::var_os("GENGCHOU_TEST_MUTEX_SUFFIX") {
         if !suffix.is_empty() {
             let suffix = suffix.to_string_lossy();
-            return (
-                format!("{LEGACY_MUTEX_NAME}-{suffix}"),
-                format!("{CURRENT_MUTEX_NAME}-{suffix}"),
-            );
+            return format!("{CURRENT_MUTEX_NAME}-{suffix}");
         }
     }
-    (
-        LEGACY_MUTEX_NAME.to_string(),
-        CURRENT_MUTEX_NAME.to_string(),
-    )
+    CURRENT_MUTEX_NAME.to_string()
 }
 
 fn acquire_named_mutex(name: &str, is_relaunch: bool) -> Option<HANDLE> {
@@ -7731,33 +7694,22 @@ fn acquire_named_mutex(name: &str, is_relaunch: bool) -> Option<HANDLE> {
 
 fn notify_existing_instance() {
     unsafe {
-        for class in [
-            BROADCAST_WINDOW_CLASS_NAME,
-            LEGACY_BROADCAST_WINDOW_CLASS_NAME,
-        ] {
-            let helper_class = native_interop::wide_str(class);
-            if let Ok(existing) =
-                FindWindowW(PCWSTR::from_raw(helper_class.as_ptr()), PCWSTR::null())
-            {
-                if existing != HWND::default() {
-                    let _ = PostMessageW(
-                        existing,
-                        WM_APP_TRAY,
-                        WPARAM(0),
-                        LPARAM(WM_LBUTTONUP as isize),
-                    );
-                    diagnose::log(format!(
-                        "asked existing instance class={class} to show details"
-                    ));
-                    return;
-                }
+        let helper_class = native_interop::wide_str(BROADCAST_WINDOW_CLASS_NAME);
+        if let Ok(existing) = FindWindowW(PCWSTR::from_raw(helper_class.as_ptr()), PCWSTR::null()) {
+            if existing != HWND::default() {
+                let _ = PostMessageW(
+                    existing,
+                    WM_APP_TRAY,
+                    WPARAM(0),
+                    LPARAM(WM_LBUTTONUP as isize),
+                );
+                diagnose::log("asked existing Gengchou instance to show details");
             }
         }
     }
 }
 
-pub fn run(_instance_guard: InstanceGuard, updates_allowed: bool) {
-    MIGRATION_UPDATES_ALLOWED.store(updates_allowed, Ordering::Release);
+pub fn run(_instance_guard: InstanceGuard) {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -8012,39 +7964,32 @@ pub fn run(_instance_guard: InstanceGuard, updates_allowed: bool) {
         // Initial theme check
         check_theme_change();
 
-        if let Err(error) = migration::mark_ready_seen() {
-            diagnose::log(format!(
-                "unable to persist migration readiness; startup stopped: {error}"
-            ));
-            return;
-        }
-        // Publish the helper marker only after the durable migration state is
-        // ready. A marker failure leaves the old helper free to roll back,
-        // while a slow state write can never start the helper's grace window.
         if let Err(error) = updater::confirm_update_ready() {
             diagnose::log(format!(
                 "unable to confirm successful update startup; startup stopped: {error}"
             ));
-            migration::show_blocking_error(&error);
-            return;
-        }
-
-        // Never start another update while the migration or the current
-        // updater transaction is still uncommitted.
-        if updates_allowed {
-            schedule_auto_update_check(hwnd);
-            let should_check_updates = {
+            let strings = {
                 let state = lock_state();
                 state
                     .as_ref()
-                    .map(|s| auto_update_check_due(s.last_update_check_unix))
-                    .unwrap_or(false)
+                    .map(|s| s.language.strings())
+                    .unwrap_or(LanguageId::English.strings())
             };
-            if should_check_updates {
-                begin_update_check(hwnd, false);
-            }
-        } else {
-            diagnose::log("update checks paused until migration stage=complete");
+            let message = format!("{}.\n\n{error}", strings.update_failed);
+            show_error_message(hwnd, strings.updates, &message);
+            return;
+        }
+
+        schedule_auto_update_check(hwnd);
+        let should_check_updates = {
+            let state = lock_state();
+            state
+                .as_ref()
+                .map(|s| auto_update_check_due(s.last_update_check_unix))
+                .unwrap_or(false)
+        };
+        if should_check_updates {
+            begin_update_check(hwnd, false);
         }
 
         // Message loop
@@ -9877,8 +9822,7 @@ fn show_context_menu(hwnd: HWND) {
         let version_label =
             version_action_label(strings, language, install_channel, &update_status);
         let version_str = native_interop::wide_str(&version_label);
-        let version_flags = if !MIGRATION_UPDATES_ALLOWED.load(Ordering::Acquire)
-            || !updater::update_channel_configured()
+        let version_flags = if !updater::update_channel_configured()
             || matches!(
                 update_status,
                 UpdateStatus::Checking | UpdateStatus::Applying

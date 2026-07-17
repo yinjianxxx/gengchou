@@ -18,25 +18,19 @@ use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const RELEASE_ASSET_NAME: &str = "gengchou.exe";
-#[cfg(test)]
-const LEGACY_RELEASE_ASSET_NAME: &str = "ai-usage-monitor.exe";
 // Fixed asset produced by .github/workflows/release.yml; self-updates refuse
 // to apply a download whose SHA-256 does not match this manifest.
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const UPDATE_READY_ENV: &str = "GENGCHOU_UPDATE_READY_FILE";
-const LEGACY_UPDATE_READY_ENV: &str = "AIUM_UPDATE_READY_FILE";
 #[cfg(debug_assertions)]
 const UPDATE_TEST_READY_DIR_ENV: &str = "GENGCHOU_UPDATE_TEST_READY_DIR";
-#[cfg(debug_assertions)]
-const LEGACY_UPDATE_TEST_READY_DIR_ENV: &str = "AIUM_UPDATE_TEST_READY_DIR";
 #[cfg(debug_assertions)]
 const UPDATE_TEST_NO_UI_ENV: &str = "GENGCHOU_UPDATE_TEST_NO_UI";
 const UPDATE_READY_PREFIX: &str = "update-ready-";
 const UPDATE_READY_SUFFIX: &str = ".marker";
 const UPDATE_READY_CONTENT: &[u8] = b"Gengchou update ready\n";
-const LEGACY_UPDATE_READY_CONTENT: &[u8] = b"AIUM update ready\n";
 const PROCESS_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const UPDATE_READY_GRACE: Duration = Duration::from_secs(2);
@@ -52,12 +46,6 @@ const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
 const WINGET_PACKAGE_ID: &str = "yinjianxxx.Gengchou";
 
 static UPDATE_READY_CONFIRMED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadyProtocol {
-    Current,
-    Legacy,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstallChannel {
@@ -129,18 +117,6 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
     }
 
     None
-}
-
-pub(crate) fn update_ready_requested() -> Result<bool, String> {
-    let current = std::env::var_os(UPDATE_READY_ENV).is_some();
-    let legacy = std::env::var_os(LEGACY_UPDATE_READY_ENV).is_some();
-    if current && legacy {
-        return Err(
-            "Both current and legacy update readiness variables are present; startup was refused."
-                .to_string(),
-        );
-    }
-    Ok(current || legacy)
 }
 
 fn parse_update_pid(value: &str) -> Result<u32, String> {
@@ -247,7 +223,6 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
         // A process installed by an earlier update inherits this variable.
         // The helper must never mistake that stale marker for its own child.
         .env_remove(UPDATE_READY_ENV)
-        .env_remove(LEGACY_UPDATE_READY_ENV)
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -373,18 +348,8 @@ fn apply_update(
 /// It is idempotent within a process. Normal launches have no marker to write;
 /// at that same healthy milestone they may remove a backup orphaned by a
 /// helper that was interrupted after a previous successful replacement.
-fn inbound_ready_request() -> Result<Option<(PathBuf, ReadyProtocol)>, String> {
-    let current = std::env::var_os(UPDATE_READY_ENV).map(PathBuf::from);
-    let legacy = std::env::var_os(LEGACY_UPDATE_READY_ENV).map(PathBuf::from);
-    match (current, legacy) {
-        (Some(_), Some(_)) => Err(
-            "Both current and legacy update readiness variables are present; startup was refused."
-                .to_string(),
-        ),
-        (Some(marker), None) => Ok(Some((marker, ReadyProtocol::Current))),
-        (None, Some(marker)) => Ok(Some((marker, ReadyProtocol::Legacy))),
-        (None, None) => Ok(None),
-    }
+fn inbound_ready_request() -> Option<PathBuf> {
+    std::env::var_os(UPDATE_READY_ENV).map(PathBuf::from)
 }
 
 pub fn confirm_update_ready() -> Result<(), String> {
@@ -393,12 +358,11 @@ pub fn confirm_update_ready() -> Result<(), String> {
     }
 
     let result = (|| {
-        if let Some((marker, protocol)) = inbound_ready_request()? {
-            validate_ready_marker_path(&marker, protocol)?;
-            write_ready_marker(&marker, protocol)?;
+        if let Some(marker) = inbound_ready_request() {
+            validate_ready_marker_path(&marker)?;
+            write_ready_marker(&marker)?;
             // Do not let a later helper inherit a marker for this transaction.
             std::env::remove_var(UPDATE_READY_ENV);
-            std::env::remove_var(LEGACY_UPDATE_READY_ENV);
             return Ok(());
         }
 
@@ -970,11 +934,9 @@ fn relaunch_target(target: &Path, ready_marker: Option<&Path>) -> Result<Child, 
     match ready_marker {
         Some(marker) => {
             command.env(UPDATE_READY_ENV, marker);
-            command.env_remove(LEGACY_UPDATE_READY_ENV);
         }
         None => {
             command.env_remove(UPDATE_READY_ENV);
-            command.env_remove(LEGACY_UPDATE_READY_ENV);
         }
     }
 
@@ -1113,12 +1075,6 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
-fn legacy_updates_dir() -> Result<PathBuf, String> {
-    dirs::data_local_dir()
-        .map(|dir| dir.join("AIUsageMonitor").join("updates"))
-        .ok_or_else(|| "Unable to resolve the legacy local updates directory.".to_string())
-}
-
 fn ready_markers_dir() -> Result<PathBuf, String> {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os(UPDATE_TEST_READY_DIR_ENV) {
@@ -1130,21 +1086,6 @@ fn ready_markers_dir() -> Result<PathBuf, String> {
     }
 
     updates_dir()
-}
-
-fn legacy_ready_markers_dir() -> Result<PathBuf, String> {
-    #[cfg(debug_assertions)]
-    if let Some(path) = std::env::var_os(LEGACY_UPDATE_TEST_READY_DIR_ENV) {
-        let path = PathBuf::from(path);
-        if path.as_os_str().is_empty() {
-            return Err(format!(
-                "{LEGACY_UPDATE_TEST_READY_DIR_ENV} must not be empty."
-            ));
-        }
-        return Ok(path);
-    }
-
-    legacy_updates_dir()
 }
 
 fn new_ready_marker_path() -> Result<PathBuf, String> {
@@ -1208,11 +1149,8 @@ fn validate_nearest_existing_ready_ancestor(path: &Path) -> Result<(), String> {
     ))
 }
 
-fn validate_ready_marker_path(marker: &Path, protocol: ReadyProtocol) -> Result<(), String> {
-    let expected_parent = match protocol {
-        ReadyProtocol::Current => ready_markers_dir()?,
-        ReadyProtocol::Legacy => legacy_ready_markers_dir()?,
-    };
+fn validate_ready_marker_path(marker: &Path) -> Result<(), String> {
+    let expected_parent = ready_markers_dir()?;
     let parent = marker
         .parent()
         .ok_or_else(|| "The update readiness marker has no parent directory.".to_string())?;
@@ -1235,11 +1173,8 @@ fn validate_ready_marker_path(marker: &Path, protocol: ReadyProtocol) -> Result<
     Ok(())
 }
 
-fn write_ready_marker(marker: &Path, protocol: ReadyProtocol) -> Result<(), String> {
-    let content = match protocol {
-        ReadyProtocol::Current => UPDATE_READY_CONTENT,
-        ReadyProtocol::Legacy => LEGACY_UPDATE_READY_CONTENT,
-    };
+fn write_ready_marker(marker: &Path) -> Result<(), String> {
+    let content = UPDATE_READY_CONTENT;
     if validate_regular_file_if_exists(marker)? {
         return if std::fs::read(marker).ok().as_deref() == Some(content) {
             Ok(())
@@ -1678,36 +1613,21 @@ mod tests {
     }
 
     #[test]
-    fn dual_asset_release_selects_the_new_binary_and_checksum() {
-        let assets = [
-            GitHubAsset {
-                name: LEGACY_RELEASE_ASSET_NAME.to_string(),
-                browser_download_url: "https://example.invalid/legacy.exe".to_string(),
-            },
-            GitHubAsset {
-                name: RELEASE_ASSET_NAME.to_string(),
-                browser_download_url: "https://example.invalid/gengchou.exe".to_string(),
-            },
-        ];
+    fn release_selects_the_named_binary_and_checksum() {
+        let assets = [GitHubAsset {
+            name: RELEASE_ASSET_NAME.to_string(),
+            browser_download_url: "https://example.invalid/gengchou.exe".to_string(),
+        }];
         assert_eq!(
             exact_release_asset(&assets).map(|asset| asset.browser_download_url.as_str()),
             Some("https://example.invalid/gengchou.exe")
         );
-        assert_eq!(
-            release_asset_named(&assets, LEGACY_RELEASE_ASSET_NAME)
-                .map(|asset| asset.browser_download_url.as_str()),
-            Some("https://example.invalid/legacy.exe")
-        );
 
-        let manifest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ai-usage-monitor.exe\n\
-                        bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gengchou.exe\n";
+        let manifest =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  gengchou.exe\n";
         assert_eq!(
             expected_checksum_from_manifest(manifest, RELEASE_ASSET_NAME).as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        );
-        assert_eq!(
-            expected_checksum_from_manifest(manifest, LEGACY_RELEASE_ASSET_NAME).as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
@@ -1949,7 +1869,6 @@ mod tests {
         assert!(command.contains(
             "Get-Command gengchou -CommandType Application -ErrorAction SilentlyContinue"
         ));
-        assert!(!command.contains("Get-Command ai-usage-monitor"));
         assert!(command.contains("$restartTarget = $installed.Source"));
         assert!(command.contains("Test-Path -LiteralPath $target -PathType Leaf"));
         assert!(command.contains("Start-Process -FilePath $restartTarget"));

@@ -92,14 +92,13 @@ Installation options, in recommended order:
 2. **Standalone EXE.** For a single-file download, get `gengchou.exe` from
    the same release and run it from any writable folder.
 
-3. **WinGet (planned for v2.3.0).** The package will use the new identity
-   below after the controlled internal migration is complete:
+3. **WinGet (when available).** The package uses this identifier:
 
    ```powershell
    winget install --id yinjianxxx.Gengchou --exact
    ```
 
-   Until that package is published, use the ZIP or EXE instead.
+   If WinGet cannot find it yet, use the ZIP or EXE instead.
 
 The executable is currently unsigned. Each release includes `SHA256SUMS` for
 download verification, and self-updates check it automatically. Starting with
@@ -167,25 +166,9 @@ each provider's own account rules:
 | Usage cache — percentages, quota-window metadata, and reset times only; never tokens | `%APPDATA%\Gengchou\usage-cache.json` |
 | Diagnostics (append-only, rotated) | `%LOCALAPPDATA%\Gengchou\diagnose.log` |
 
-v2.2.4 is the one-time migration bridge. Its first healthy launch verifies and
-copies settings and a fresh usage cache to the paths above, moves the Start
-with Windows entry, and leaves the source files untouched. Exit Gengchou and
-start it once more; the second launch removes only the known files owned by
-this project. Data belonging to the original CodeZeno app may be read only as
-a settings fallback and is never deleted. If unknown files or reparse points
-remain, monitoring still works, but cleanup stays pending and updates remain
-disabled. Update checks stay off until cleanup completes, so the bridge cannot
-be skipped accidentally.
-
-After upgrading from an earlier version and completing the second launch,
-place `verify-v2.2.4-migration.ps1` beside the release `SHA256SUMS`, then run
-`verify-v2.2.4-migration.ps1 -RequireMigratedSource -RequireOfficialHash`.
-For a clean v2.2.4 installation with no earlier settings, omit
-`-RequireMigratedSource`.
-It checks the official binary hash, running version, migration state, settings,
-startup entry, runtime identity, and the absence of this project's old data
-directories. The old diagnostic log is not copied; v2.2.4 starts a new one
-under the Gengchou path.
+v2.3.0 reads and writes only the Gengchou paths above. Installations older than
+v2.2.4 must first run the retained v2.2.4 bridge twice and complete its
+verification before moving to v2.3.0 or later.
 
 To uninstall: disable **Start with Windows** if you enabled it, then delete
 the executable, `%APPDATA%\Gengchou`, and `%LOCALAPPDATA%\Gengchou`.

@@ -7,9 +7,9 @@ Microsoft Remote Desktop transitions and explorer.exe taskbar rebuilds without
 crashing or permanently losing the embedded widget; it has since developed
 independently. The independent project was initially released as AI Usage
 Monitor and adopted the Gengchou name on the 2.2.x line. The rename changes
-the public product identity. v2.2.4 is the controlled bridge that moves the
-remaining internal Windows identity and user data to Gengchou; v2.3.0 removes
-the bridge after all supported installations have completed it.
+the public product identity. v2.2.4 was the controlled bridge that moved the
+remaining internal Windows identity and user data to Gengchou. After all
+supported installations completed it, v2.3.0 retired the bridge.
 
 ## Relationship to the original project
 
@@ -24,7 +24,7 @@ the bridge after all supported installations have completed it.
 |---|---|---|
 | Package and EXE | claude-code-usage-monitor | gengchou |
 | Version line | 1.4.x | 2.x |
-| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\Gengchou; v2.2.4 also holds Global\AIUsageMonitor during the bridge |
+| Single-instance mutex | Global\ClaudeCodeUsageMonitor | Global\Gengchou (v2.2.4 temporarily held the retired project mutex during the bridge) |
 | Window class | ClaudeCodeUsageMonitor | Gengchou |
 | Settings directory | %APPDATA%\ClaudeCodeUsageMonitor | %APPDATA%\Gengchou |
 | Diagnostic log | %TEMP%\claude-code-usage-monitor.log | %LOCALAPPDATA%\Gengchou\diagnose.log |

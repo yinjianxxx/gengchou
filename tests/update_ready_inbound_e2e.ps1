@@ -8,18 +8,18 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($BinaryPath)) {
-    $BinaryPath = Join-Path $PSScriptRoot '..\target\debug\gengchou.exe'
+    $BinaryPath = Join-Path $repoRoot 'target\debug\gengchou.exe'
 }
 $BinaryPath = [IO.Path]::GetFullPath($BinaryPath)
 if (-not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
     throw "Debug binary not found: $BinaryPath"
 }
 
-$root = Join-Path ([IO.Path]::GetTempPath()) (
-    'gengchou-legacy-inbound-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N')
-)
-$readyDir = Join-Path $root 'legacy-ready'
+$e2eRoot = Join-Path $repoRoot 'target\update-ready-inbound-e2e'
+$testRoot = Join-Path $e2eRoot ([Guid]::NewGuid().ToString('N'))
+$readyDir = Join-Path $testRoot 'ready'
 $marker = Join-Path $readyDir 'update-ready-e2e.marker'
 New-Item -ItemType Directory -Path $readyDir -Force | Out-Null
 
@@ -34,7 +34,7 @@ function Invoke-ReadyProbe {
     try {
         $process = Start-Process -FilePath $BinaryPath `
             -ArgumentList '--confirm-update-ready-test' `
-            -WorkingDirectory $root `
+            -WorkingDirectory $testRoot `
             -WindowStyle Hidden `
             -PassThru
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
@@ -51,37 +51,30 @@ function Invoke-ReadyProbe {
 }
 
 try {
-    $baseEnvironment = @{
-        'APPDATA' = (Join-Path $root 'Roaming')
-        'LOCALAPPDATA' = (Join-Path $root 'Local')
-        'AIUM_UPDATE_TEST_READY_DIR' = $readyDir
-        'AIUM_UPDATE_READY_FILE' = $marker
+    $environment = @{
+        'APPDATA' = (Join-Path $testRoot 'Roaming')
+        'LOCALAPPDATA' = (Join-Path $testRoot 'Local')
+        'GENGCHOU_UPDATE_TEST_READY_DIR' = $readyDir
+        'GENGCHOU_UPDATE_READY_FILE' = $marker
     }
-    $exitCode = Invoke-ReadyProbe -Environment $baseEnvironment
+    $exitCode = Invoke-ReadyProbe -Environment $environment
     if ($exitCode -ne 0) {
-        throw "Legacy inbound readiness probe exited with $exitCode."
+        throw "Inbound readiness probe exited with $exitCode."
     }
     $content = [IO.File]::ReadAllText($marker, [Text.Encoding]::UTF8)
-    if ($content -ne "AIUM update ready`n") {
-        throw 'Legacy helper marker content was not preserved exactly.'
+    if ($content -ne "Gengchou update ready`n") {
+        throw 'Update readiness marker content was not preserved exactly.'
     }
 
-    Remove-Item -LiteralPath $marker -Force
-    $dualEnvironment = @{}
-    foreach ($entry in $baseEnvironment.GetEnumerator()) {
-        $dualEnvironment[$entry.Key] = $entry.Value
-    }
-    $dualEnvironment['GENGCHOU_UPDATE_READY_FILE'] = $marker
-    $dualEnvironment['GENGCHOU_UPDATE_TEST_READY_DIR'] = $readyDir
-    $exitCode = Invoke-ReadyProbe -Environment $dualEnvironment
-    if ($exitCode -eq 0 -or (Test-Path -LiteralPath $marker)) {
-        throw 'Dual readiness variables were not rejected fail-closed.'
-    }
-
-    Write-Output 'Legacy updater inbound E2E passed: old marker accepted; dual env rejected.'
+    Write-Output 'Updater inbound E2E passed: the current marker was validated and written.'
 }
 finally {
-    if (Test-Path -LiteralPath $root) {
-        Remove-Item -LiteralPath $root -Recurse -Force
+    $resolvedRoot = [IO.Path]::GetFullPath($testRoot)
+    $allowedPrefix = [IO.Path]::GetFullPath($e2eRoot).TrimEnd('\') + '\'
+    if (-not $resolvedRoot.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing cleanup outside the updater inbound E2E root: $resolvedRoot"
+    }
+    if (Test-Path -LiteralPath $resolvedRoot) {
+        Remove-Item -LiteralPath $resolvedRoot -Recurse -Force
     }
 }
