@@ -73,6 +73,27 @@ struct ProviderWidgetData {
     windows: Vec<WidgetUsageWindow>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ProviderRequestFailures {
+    claude_code: u8,
+    codex: u8,
+    antigravity: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MonitorIdentity {
+    device: String,
+    is_primary: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SurfaceTopologyReset {
+    taskbar: bool,
+    floating: bool,
+    details: bool,
+    settings_changed: bool,
+}
+
 struct AppState {
     hwnd: SendHwnd,
     taskbar_hwnd: Option<HWND>,
@@ -104,6 +125,7 @@ struct AppState {
     /// The error of the last completely failed poll (every enabled provider
     /// failed), for the detail popup's per-provider status badges.
     last_error: Option<poller::PollError>,
+    provider_request_failures: ProviderRequestFailures,
 
     poll_interval_ms: u32,
     retry_count: u32,
@@ -118,7 +140,9 @@ struct AppState {
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
     details_hwnd: Option<HWND>,
+    details_monitor: Option<MonitorIdentity>,
     floating_hwnd: Option<HWND>,
+    floating_monitor: Option<MonitorIdentity>,
     floating_visible: bool,
     detailed_tray_icons: bool,
     floating_x: Option<i32>,
@@ -126,6 +150,7 @@ struct AppState {
     widget_tooltip_hwnd: Option<SendHwnd>,
 
     taskbar_index: usize,
+    taskbar_monitor: Option<MonitorIdentity>,
     tray_offset: i32,
     preferred_taskbar_index: usize,
     preferred_tray_offset: i32,
@@ -1781,15 +1806,97 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         diagnose::log("tray event hook could not be installed");
     }
 
+    let monitor = unsafe { monitor_identity_for_taskbar(&taskbar) };
     let mut state = lock_state();
     if let Some(s) = state.as_mut() {
         s.taskbar_hwnd = Some(taskbar.hwnd);
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
+        s.taskbar_monitor = monitor;
         s.embedded = true;
     }
     true
+}
+
+unsafe fn monitor_identity_from_handle(monitor: HMONITOR) -> Option<MonitorIdentity> {
+    if monitor.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFOEXW::default();
+    info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if !GetMonitorInfoW(monitor, &mut info.monitorInfo).as_bool() {
+        return None;
+    }
+    let end = info
+        .szDevice
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(info.szDevice.len());
+    let device = String::from_utf16_lossy(&info.szDevice[..end]);
+    if device.is_empty() {
+        return None;
+    }
+    Some(MonitorIdentity {
+        device,
+        is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+    })
+}
+
+fn active_monitor_identities() -> Vec<MonitorIdentity> {
+    unsafe extern "system" fn enum_monitor(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let monitors = &mut *(data.0 as *mut Vec<MonitorIdentity>);
+        if let Some(identity) = monitor_identity_from_handle(monitor) {
+            monitors.push(identity);
+        }
+        BOOL(1)
+    }
+
+    let mut monitors = Vec::new();
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            HDC::default(),
+            None,
+            Some(enum_monitor),
+            LPARAM(&mut monitors as *mut _ as isize),
+        );
+    }
+    monitors
+}
+
+unsafe fn monitor_identity_for_taskbar(
+    taskbar: &native_interop::TaskbarWindow,
+) -> Option<MonitorIdentity> {
+    let point = POINT {
+        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
+        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
+    };
+    monitor_identity_from_handle(MonitorFromPoint(point, MONITOR_DEFAULTTONULL))
+}
+
+unsafe fn monitor_identity_for_window(hwnd: HWND) -> Option<MonitorIdentity> {
+    monitor_identity_from_handle(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL))
+}
+
+unsafe fn monitor_identity_for_rect(rect: &RECT) -> Option<MonitorIdentity> {
+    monitor_identity_from_handle(MonitorFromRect(rect, MONITOR_DEFAULTTONULL))
+}
+
+fn secondary_monitor_disappeared(
+    previous: Option<&MonitorIdentity>,
+    active: &[MonitorIdentity],
+) -> bool {
+    previous.is_some_and(|previous| {
+        !previous.is_primary
+            && !active
+                .iter()
+                .any(|monitor| monitor.device == previous.device)
+    })
 }
 
 fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
@@ -1974,16 +2081,19 @@ fn set_widget_placeholders(state: &mut AppState, text: &str) {
     state.claude_widget = placeholder_widget();
     state.codex_widget = placeholder_widget();
     state.antigravity_widget = placeholder_widget();
-    let compact_text = if text == "!" { "--" } else { text };
     state.compact_vm = compact_view::placeholder_model(
-        compact_text,
+        text,
         &state.provider_order,
         state.show_claude_code,
         state.show_codex,
         state.show_antigravity,
     );
-    if text == "!" {
-        mark_all_compact_providers_error(&mut state.compact_vm);
+}
+
+fn set_widget_failure_placeholders(state: &mut AppState, attention: compact_view::Attention) {
+    set_widget_placeholders(state, "--");
+    for provider in &mut state.compact_vm.providers {
+        provider.attention = attention;
     }
 }
 
@@ -2007,15 +2117,94 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.show_codex,
         state.show_antigravity,
     );
-    if state.last_error.is_some() {
-        mark_all_compact_providers_error(&mut state.compact_vm);
+
+    let global_status = state.last_error.map(poller::provider_status);
+    let claude_status = data
+        .and_then(|data| data.claude_code_error)
+        .or(global_status);
+    let codex_status = data.and_then(|data| data.codex_error).or(global_status);
+    let antigravity_status = data
+        .and_then(|data| data.antigravity_error)
+        .or(global_status);
+    for provider in &mut state.compact_vm.providers {
+        let status = match provider.kind {
+            tray_icon::TrayIconKind::Claude => claude_status,
+            tray_icon::TrayIconKind::Codex => codex_status,
+            tray_icon::TrayIconKind::Antigravity => antigravity_status,
+        };
+        provider.attention = compact_attention_for_provider_status(provider.attention, status);
     }
 }
 
-fn mark_all_compact_providers_error(vm: &mut CompactViewModel) {
-    for provider in &mut vm.providers {
-        provider.attention = compact_view::Attention::Error;
+fn compact_attention_for_provider_status(
+    current: compact_view::Attention,
+    status: Option<ProviderStatus>,
+) -> compact_view::Attention {
+    match status {
+        Some(ProviderStatus::AuthRequired) => compact_view::Attention::Error,
+        Some(ProviderStatus::RateLimited | ProviderStatus::RequestFailed) => {
+            compact_view::Attention::Degraded
+        }
+        None => current,
     }
+}
+
+fn request_failure_count_after(current: u8, status: Option<ProviderStatus>) -> u8 {
+    if status == Some(ProviderStatus::RequestFailed) {
+        current.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn update_request_failure_count(
+    count: &mut u8,
+    provider: &str,
+    enabled: bool,
+    status: Option<ProviderStatus>,
+) {
+    if !enabled {
+        *count = 0;
+        return;
+    }
+
+    let previous = *count;
+    *count = request_failure_count_after(previous, status);
+    if *count > previous {
+        diagnose::log(format!(
+            "{provider} usage poll consecutive transient failures={}",
+            *count
+        ));
+    } else if status.is_none() && previous > 0 {
+        diagnose::log(format!(
+            "{provider} usage poll recovered after {previous} consecutive transient failure(s)"
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_provider_request_failures(
+    failures: &mut ProviderRequestFailures,
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    claude_status: Option<ProviderStatus>,
+    codex_status: Option<ProviderStatus>,
+    antigravity_status: Option<ProviderStatus>,
+) {
+    update_request_failure_count(
+        &mut failures.claude_code,
+        "Claude",
+        show_claude_code,
+        claude_status,
+    );
+    update_request_failure_count(&mut failures.codex, "Codex", show_codex, codex_status);
+    update_request_failure_count(
+        &mut failures.antigravity,
+        "Antigravity",
+        show_antigravity,
+        antigravity_status,
+    );
 }
 
 fn merge_missing_provider_data(
@@ -2355,6 +2544,7 @@ fn show_usage_details(_tray_hwnd: HWND) {
                 );
                 let _ = InvalidateRect(detail_hwnd, None, false);
                 let _ = SetForegroundWindow(detail_hwnd);
+                remember_detail_monitor(detail_hwnd);
                 return;
             }
         }
@@ -2431,6 +2621,7 @@ fn show_usage_details(_tray_hwnd: HWND) {
             ) {
                 diagnose::log_error("detail popup: DPI-aware initial positioning failed", error);
             }
+            remember_detail_monitor(detail_hwnd);
         }
 
         diagnose::log(format!("detail popup: created hwnd={:?}", detail_hwnd));
@@ -2859,6 +3050,16 @@ fn refresh_detail_popup_if_open() {
             );
         }
         let _ = InvalidateRect(detail_hwnd, None, false);
+    }
+}
+
+unsafe fn remember_detail_monitor(hwnd: HWND) {
+    let monitor = monitor_identity_for_window(hwnd);
+    let mut state = lock_state();
+    if let Some(s) = state.as_mut() {
+        if s.details_hwnd.is_some_and(|stored| stored.0 == hwnd.0) {
+            s.details_monitor = monitor;
+        }
     }
 }
 
@@ -3481,6 +3682,50 @@ fn clamp_i32(value: i32, min_value: i32, max_value: i32) -> i32 {
     value.max(min_value).min(max_value)
 }
 
+fn bottom_right_default_position(work: RECT, width: i32, height: i32, margin: i32) -> (i32, i32) {
+    let min_x = work.left + margin;
+    let min_y = work.top + margin;
+    (
+        clamp_i32(
+            work.right - width - margin,
+            min_x,
+            work.right - width - margin,
+        ),
+        clamp_i32(
+            work.bottom - height - margin,
+            min_y,
+            work.bottom - height - margin,
+        ),
+    )
+}
+
+unsafe fn reset_detail_popup_to_primary_default() {
+    let detail_hwnd = {
+        let state = lock_state();
+        state.as_ref().and_then(|s| s.details_hwnd)
+    };
+    let Some(detail_hwnd) = detail_hwnd.filter(|hwnd| IsWindow(*hwnd).as_bool()) else {
+        return;
+    };
+
+    let _dpi_scope = DpiScope::new(GetDpiForSystem());
+    let snapshot = detail_popup_snapshot();
+    let (width, height) = detail_popup_size(&snapshot);
+    let (x, y) = bottom_right_default_position(primary_work_area(), width, height, sc(8));
+    let _ = SetWindowPos(
+        detail_hwnd,
+        HWND_TOPMOST,
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    remember_detail_monitor(detail_hwnd);
+    let _ = InvalidateRect(detail_hwnd, None, false);
+    diagnose::log("detail popup: disconnected secondary monitor; reset to primary default");
+}
+
 fn ensure_detail_window_class() -> bool {
     if DETAIL_CLASS_REGISTERED.load(Ordering::SeqCst) {
         return true;
@@ -3546,8 +3791,13 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             let new_dpi = dpi_from_wparam(wparam);
             let _message_dpi_scope = DpiScope::new(new_dpi);
             apply_suggested_dpi_rect(hwnd, lparam, "detail popup");
+            remember_detail_monitor(hwnd);
             let _ = InvalidateRect(hwnd, None, false);
             diagnose::log(format!("detail popup: dpi changed dpi={new_dpi}"));
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            remember_detail_monitor(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -3685,6 +3935,7 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 if let Some(s) = state.as_mut() {
                     if s.details_hwnd.is_some_and(|stored| stored.0 == hwnd.0) {
                         s.details_hwnd = None;
+                        s.details_monitor = None;
                     }
                 }
             }
@@ -3751,16 +4002,19 @@ unsafe fn primary_work_area() -> RECT {
     }
 }
 
-unsafe fn work_area_near(x: i32, y: i32) -> RECT {
-    let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+unsafe fn work_area_for_rect(rect: &RECT) -> Option<RECT> {
+    let monitor = MonitorFromRect(rect, MONITOR_DEFAULTTONULL);
+    if monitor.is_invalid() {
+        return None;
+    }
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
-        info.rcWork
+        Some(info.rcWork)
     } else {
-        primary_work_area()
+        None
     }
 }
 
@@ -3769,19 +4023,31 @@ unsafe fn floating_target_position(
     height: i32,
     stored_x: Option<i32>,
     stored_y: Option<i32>,
-) -> (i32, i32) {
+) -> (i32, i32, bool) {
     let margin = sc(FLOATING_MARGIN);
     match (stored_x, stored_y) {
         (Some(x), Some(y)) => {
-            let work = work_area_near(x, y);
-            (
-                clamp_i32(x, work.left + margin, work.right - width - margin),
-                clamp_i32(y, work.top + margin, work.bottom - height - margin),
-            )
+            let rect = RECT {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            };
+            if let Some(work) = work_area_for_rect(&rect) {
+                (
+                    clamp_i32(x, work.left + margin, work.right - width - margin),
+                    clamp_i32(y, work.top + margin, work.bottom - height - margin),
+                    false,
+                )
+            } else {
+                let (x, y) =
+                    bottom_right_default_position(primary_work_area(), width, height, margin);
+                (x, y, true)
+            }
         }
         _ => {
-            let work = primary_work_area();
-            (work.right - width - margin, work.bottom - height - margin)
+            let (x, y) = bottom_right_default_position(primary_work_area(), width, height, margin);
+            (x, y, false)
         }
     }
 }
@@ -3868,7 +4134,8 @@ fn ensure_floating_monitor_window() -> Option<HWND> {
             )
         };
         let (width, height) = floating_monitor_size(None);
-        let (x, y) = floating_target_position(width, height, stored_x, stored_y);
+        let (mut x, mut y, mut position_reset) =
+            floating_target_position(width, height, stored_x, stored_y);
         let class_name = native_interop::wide_str(FLOATING_WINDOW_CLASS_NAME);
         let title = native_interop::wide_str(title);
         let hwnd = match CreateWindowExW(
@@ -3894,7 +4161,11 @@ fn ensure_floating_monitor_window() -> Option<HWND> {
         {
             let _dpi_scope = DpiScope::for_window(hwnd);
             let (width, height) = floating_monitor_size(Some(hwnd));
-            let (x, y) = floating_target_position(width, height, stored_x, stored_y);
+            let (next_x, next_y, reset) =
+                floating_target_position(width, height, stored_x, stored_y);
+            x = next_x;
+            y = next_y;
+            position_reset |= reset;
             if let Err(error) =
                 SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE)
             {
@@ -3905,11 +4176,21 @@ fn ensure_floating_monitor_window() -> Option<HWND> {
             }
         }
         apply_floating_dwm_style(hwnd, is_dark, high_contrast);
+        let monitor = monitor_identity_for_window(hwnd);
         {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.floating_hwnd = Some(hwnd);
+                s.floating_monitor = monitor;
+                if position_reset {
+                    s.floating_x = Some(x);
+                    s.floating_y = Some(y);
+                }
             }
+        }
+        if position_reset {
+            diagnose::log("floating monitor: stored display unavailable; reset to primary default");
+            save_state_settings();
         }
         diagnose::log(format!("floating monitor: created hwnd={:?}", hwnd));
         Some(hwnd)
@@ -3932,15 +4213,30 @@ fn refresh_floating_monitor(reset_position: bool) {
     // permanently hidden HWND for users who never enable the floating window.
     // Resetting while hidden still records the primary-work-area default.
     if !visible {
-        if reset_position {
-            let _dpi_scope = DpiScope::new(unsafe { GetDpiForSystem() });
-            let (width, height) = floating_monitor_size(None);
-            let (x, y) = unsafe { floating_target_position(width, height, None, None) };
+        let _dpi_scope = DpiScope::new(unsafe { GetDpiForSystem() });
+        let (width, height) = floating_monitor_size(None);
+        let (x, y, missing_monitor) =
+            unsafe { floating_target_position(width, height, stored_x, stored_y) };
+        if reset_position || missing_monitor {
+            let rect = RECT {
+                left: x,
+                top: y,
+                right: x + width,
+                bottom: y + height,
+            };
+            let monitor = unsafe { monitor_identity_for_rect(&rect) };
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
                 s.floating_x = Some(x);
                 s.floating_y = Some(y);
+                s.floating_monitor = monitor;
             }
+        }
+        if missing_monitor {
+            diagnose::log(
+                "floating monitor: hidden position display unavailable; reset to primary default",
+            );
+            save_state_settings();
         }
         return;
     }
@@ -3956,19 +4252,27 @@ fn refresh_floating_monitor(reset_position: bool) {
             let _ = InvalidateRect(hwnd, None, false);
             return;
         }
-        let (x, y) = floating_target_position(width, height, stored_x, stored_y);
+        let (x, y, missing_monitor) = floating_target_position(width, height, stored_x, stored_y);
         // WS_EX_TOPMOST keeps the window in the topmost band. Preserve its
         // relative z-order here: this path runs on every countdown update and
         // must not repeatedly jump ahead of unrelated topmost windows.
         let flags = SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW;
         let _ = SetWindowPos(hwnd, HWND::default(), x, y, width, height, flags);
         let _ = InvalidateRect(hwnd, None, false);
-        if reset_position {
+        let monitor = monitor_identity_for_window(hwnd);
+        {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
-                s.floating_x = Some(x);
-                s.floating_y = Some(y);
+                s.floating_monitor = monitor;
+                if reset_position || missing_monitor {
+                    s.floating_x = Some(x);
+                    s.floating_y = Some(y);
+                }
             }
+        }
+        if missing_monitor {
+            diagnose::log("floating monitor: stored display unavailable; reset to primary default");
+            save_state_settings();
         }
     }
 }
@@ -4016,12 +4320,14 @@ fn remember_floating_position(hwnd: HWND) -> bool {
         if GetWindowRect(hwnd, &mut rect).is_err() {
             return false;
         }
+        let monitor = monitor_identity_for_window(hwnd);
         let mut state = lock_state();
         let Some(s) = state.as_mut() else {
             return false;
         };
         s.floating_x = Some(rect.left);
         s.floating_y = Some(rect.top);
+        s.floating_monitor = monitor;
         true
     }
 }
@@ -6970,10 +7276,80 @@ unsafe fn handle_usage_updated() {
     refresh_detail_popup_if_open();
 }
 
+fn reconcile_surface_topology() -> SurfaceTopologyReset {
+    let active_monitors = active_monitor_identities();
+    if active_monitors.is_empty() {
+        return SurfaceTopologyReset::default();
+    }
+    let primary_monitor = active_monitors
+        .iter()
+        .find(|monitor| monitor.is_primary)
+        .cloned();
+    let taskbars = native_interop::find_taskbars();
+    let taskbar_monitors = taskbars
+        .iter()
+        .map(|taskbar| unsafe { monitor_identity_for_taskbar(taskbar) })
+        .collect::<Vec<_>>();
+    let primary_taskbar_index = taskbar_monitors
+        .iter()
+        .position(|monitor| monitor.as_ref().is_some_and(|monitor| monitor.is_primary))
+        .unwrap_or(0);
+
+    let mut reset = SurfaceTopologyReset::default();
+    let mut state = lock_state();
+    let Some(s) = state.as_mut() else {
+        return reset;
+    };
+
+    if !taskbars.is_empty() {
+        if secondary_monitor_disappeared(s.taskbar_monitor.as_ref(), &active_monitors) {
+            s.taskbar_index = primary_taskbar_index;
+            s.preferred_taskbar_index = primary_taskbar_index;
+            s.tray_offset = 0;
+            s.preferred_tray_offset = 0;
+            s.taskbar_monitor = primary_monitor.clone();
+            reset.taskbar = true;
+            reset.settings_changed = true;
+        } else if let Some(previous) = s.taskbar_monitor.as_ref() {
+            if let Some(index) = taskbar_monitors.iter().position(|monitor| {
+                monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.device == previous.device)
+            }) {
+                if s.preferred_taskbar_index != index {
+                    s.preferred_taskbar_index = index;
+                    reset.settings_changed = true;
+                }
+            }
+        }
+    }
+
+    if secondary_monitor_disappeared(s.floating_monitor.as_ref(), &active_monitors) {
+        s.floating_x = None;
+        s.floating_y = None;
+        s.floating_monitor = primary_monitor.clone();
+        reset.floating = true;
+        reset.settings_changed = true;
+    }
+    if secondary_monitor_disappeared(s.details_monitor.as_ref(), &active_monitors) {
+        s.details_monitor = primary_monitor;
+        reset.details = true;
+    }
+
+    reset
+}
+
 unsafe fn recover_shell_surfaces(reason: &str) {
     diagnose::log(format!("shell recovery requested: {reason}"));
     check_theme_change();
     check_language_change();
+    let topology_reset = reconcile_surface_topology();
+    if topology_reset.taskbar || topology_reset.floating || topology_reset.details {
+        diagnose::log(format!(
+            "secondary display removed; reset surfaces taskbar={} floating={} details={}",
+            topology_reset.taskbar, topology_reset.floating, topology_reset.details
+        ));
+    }
 
     let (main_hwnd, stored_taskbar, widget_visible) = {
         let state = lock_state();
@@ -6986,9 +7362,10 @@ unsafe fn recover_shell_surfaces(reason: &str) {
             None => return,
         }
     };
-    let binding_ok = stored_taskbar.is_some_and(|taskbar| {
-        native_interop::is_embedded_in_taskbar(main_hwnd, HWND(taskbar as *mut _))
-    });
+    let binding_ok = !topology_reset.taskbar
+        && stored_taskbar.is_some_and(|taskbar| {
+            native_interop::is_embedded_in_taskbar(main_hwnd, HWND(taskbar as *mut _))
+        });
 
     if binding_ok {
         position_at_taskbar();
@@ -7003,8 +7380,15 @@ unsafe fn recover_shell_surfaces(reason: &str) {
         }
         revive_request();
     }
-    refresh_floating_monitor(false);
-    refresh_detail_popup_if_open();
+    refresh_floating_monitor(topology_reset.floating);
+    if topology_reset.details {
+        reset_detail_popup_to_primary_default();
+    } else {
+        refresh_detail_popup_if_open();
+    }
+    if topology_reset.settings_changed {
+        save_state_settings();
+    }
 }
 
 unsafe fn handle_session_change(code: usize) {
@@ -7313,6 +7697,7 @@ pub fn run() {
                 data: None,
                 data_is_cached: false,
                 last_error: None,
+                provider_request_failures: ProviderRequestFailures::default(),
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 force_notify_auth_error: false,
@@ -7326,13 +7711,16 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 details_hwnd: None,
+                details_monitor: None,
                 floating_hwnd: None,
+                floating_monitor: None,
                 floating_visible: settings.floating_visible,
                 detailed_tray_icons: settings.detailed_tray_icons,
                 floating_x: settings.floating_x,
                 floating_y: settings.floating_y,
                 widget_tooltip_hwnd: None,
                 taskbar_index: settings.taskbar_index,
+                taskbar_monitor: None,
                 tray_offset: settings.tray_offset,
                 preferred_taskbar_index: settings.taskbar_index,
                 preferred_tray_offset: settings.tray_offset,
@@ -7692,6 +8080,16 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
             if let Some(s) = state.as_mut() {
                 let rate_limited = data.rate_limited;
                 let retry_after_ms = data.rate_limit_retry_after_ms;
+                let claude_poll_healthy = data.claude_code_error.is_none();
+                update_provider_request_failures(
+                    &mut s.provider_request_failures,
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    data.claude_code_error,
+                    data.codex_error,
+                    data.antigravity_error,
+                );
                 let merged = merge_missing_provider_data(
                     s.data.as_ref(),
                     data,
@@ -7756,11 +8154,26 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                     }
                 } else {
                     s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
+                    // Re-arm from completion instead of keeping the old
+                    // periodic phase, pulled forward to the Claude cache
+                    // cooldown deadline when that lands before the next fixed
+                    // tick - otherwise the observed Claude cadence stretches
+                    // to 180s/120s plus up to one user interval. Skipped
+                    // while the Claude poll itself is failing so the deadline
+                    // of a stale cache cannot tighten the retry loop.
+                    let interval = if s.show_claude_code && claude_poll_healthy {
+                        poller::claude_aligned_poll_delay_ms(s.poll_interval_ms)
+                            .unwrap_or(s.poll_interval_ms)
+                    } else {
+                        s.poll_interval_ms
+                    };
+                    if interval < s.poll_interval_ms {
+                        diagnose::log(format!(
+                            "poll timer aligned to the Claude cooldown deadline in {}s",
+                            interval / 1000
+                        ));
+                    }
                     unsafe {
-                        // Re-arm from completion instead of keeping the old
-                        // periodic phase. Claude can then reach its 180s/120s
-                        // eligibility deadline without sampling just before it.
                         SetTimer(controller_hwnd, TIMER_POLL, interval, None);
                     }
                 }
@@ -7780,7 +8193,9 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
 
             post_usage_updated();
         }
-        Err(e) => {
+        Err(failure) => {
+            let e = failure.error;
+            let failed_data = *failure.data;
             let auth_watch = credential_watch_mode_for_failure(
                 e,
                 show_claude_code,
@@ -7800,6 +8215,15 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                 }
                 let mut should_notify = false;
                 if let Some(s) = state.as_mut() {
+                    update_provider_request_failures(
+                        &mut s.provider_request_failures,
+                        s.show_claude_code,
+                        s.show_codex,
+                        s.show_antigravity,
+                        failed_data.claude_code_error,
+                        failed_data.codex_error,
+                        failed_data.antigravity_error,
+                    );
                     s.last_poll_ok = false;
                     s.last_error = Some(e);
                     match auth_watch {
@@ -7812,7 +8236,7 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                             s.auth_error_paused_polling = true;
                             s.auth_watch_mode = watch_mode;
                             s.auth_watch_snapshot = watch_snapshot;
-                            set_widget_placeholders(s, "!");
+                            set_widget_failure_placeholders(s, compact_view::Attention::Error);
                             s.retry_count = s.retry_count.saturating_add(1);
                             unsafe {
                                 let _ = KillTimer(controller_hwnd, TIMER_POLL);
@@ -7826,19 +8250,21 @@ fn do_poll(generation: u64, force_claude_refresh: bool) {
                             s.auth_error_paused_polling = false;
                             s.auth_watch_mode = poller::CredentialWatchMode::ActiveSource;
                             s.auth_watch_snapshot.clear();
-                            if s.data.is_some() {
-                                // Any transient failure (429, network blip,
-                                // server error) keeps the last known numbers
-                                // on screen - cached or live - instead of
-                                // blanking them to "..."; the popup's status
-                                // badges carry the failure. Re-derive the
-                                // texts in case a manual refresh already
-                                // replaced them with the loading placeholder.
-                                s.last_poll_ok = true;
-                                refresh_usage_texts(s);
-                            } else {
-                                set_widget_placeholders(s, "...");
-                            }
+                            // Keep exact per-provider failure reasons even
+                            // when no provider succeeded. The aggregate error
+                            // controls retry timing only; it must not turn one
+                            // provider's auth failure into every provider's
+                            // red marker (or hide it behind a network error).
+                            let merged = merge_missing_provider_data(
+                                s.data.as_ref(),
+                                failed_data,
+                                s.show_claude_code,
+                                s.show_codex,
+                                s.show_antigravity,
+                            );
+                            s.data = Some(merged);
+                            s.last_poll_ok = true;
+                            refresh_usage_texts(s);
                             s.retry_count = s.retry_count.saturating_add(1);
                             let retry_ms = match e {
                                 poller::PollError::RateLimited(retry_after_ms) => {
@@ -10285,5 +10711,82 @@ mod reset_notification_tests {
         assert!(merged.claude_code.is_some());
         assert_eq!(merged.claude_code_updated_unix, Some(100));
         assert_eq!(merged.codex_updated_unix, Some(200));
+    }
+
+    #[test]
+    fn compact_error_policy_reserves_red_for_user_action() {
+        assert_eq!(
+            compact_attention_for_provider_status(
+                compact_view::Attention::Normal,
+                Some(ProviderStatus::RequestFailed),
+            ),
+            compact_view::Attention::Degraded
+        );
+        assert_eq!(
+            compact_attention_for_provider_status(
+                compact_view::Attention::Normal,
+                Some(ProviderStatus::RateLimited),
+            ),
+            compact_view::Attention::Degraded
+        );
+        assert_eq!(
+            compact_attention_for_provider_status(
+                compact_view::Attention::Normal,
+                Some(ProviderStatus::AuthRequired),
+            ),
+            compact_view::Attention::Error
+        );
+    }
+
+    #[test]
+    fn request_failure_counter_resets_after_a_healthy_poll() {
+        let first = request_failure_count_after(0, Some(ProviderStatus::RequestFailed));
+        let second = request_failure_count_after(first, Some(ProviderStatus::RequestFailed));
+        let recovered = request_failure_count_after(second, None);
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(recovered, 0);
+    }
+
+    #[test]
+    fn topology_reset_requires_a_disappeared_secondary_monitor() {
+        let primary = MonitorIdentity {
+            device: "DISPLAY1".to_string(),
+            is_primary: true,
+        };
+        let secondary = MonitorIdentity {
+            device: "DISPLAY2".to_string(),
+            is_primary: false,
+        };
+
+        assert!(secondary_monitor_disappeared(
+            Some(&secondary),
+            std::slice::from_ref(&primary)
+        ));
+        assert!(!secondary_monitor_disappeared(
+            Some(&secondary),
+            &[primary.clone(), secondary.clone()]
+        ));
+        assert!(!secondary_monitor_disappeared(
+            Some(&primary),
+            std::slice::from_ref(&secondary)
+        ));
+        assert!(!secondary_monitor_disappeared(None, &[primary]));
+    }
+
+    #[test]
+    fn primary_default_position_is_bottom_right_inside_the_work_area() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1_920,
+            bottom: 1_040,
+        };
+        assert_eq!(
+            bottom_right_default_position(work, 180, 52, 8),
+            (1_732, 980)
+        );
+        assert_eq!(bottom_right_default_position(work, 2_000, 1_100, 8), (8, 8));
     }
 }

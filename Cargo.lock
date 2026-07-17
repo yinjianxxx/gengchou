@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "gengchou"
-version = "2.2.1"
+version = "2.2.2"
 dependencies = [
  "dirs",
  "native-tls",

@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
@@ -24,6 +24,11 @@ const CLAUDE_USAGE_FAST_EXTRA: u32 = 2;
 const CLAUDE_RATE_LIMIT_MIN_RETRY_MS: u32 = 300_000;
 const CLAUDE_RATE_LIMIT_MAX_RETRY_MS: u32 = 3_600_000;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+const CODEX_REQUEST_TIMEOUT_SECS: u64 = 10;
+const CODEX_RETRY_DELAY_MS: u64 = 1_000;
+const ANTIGRAVITY_REQUEST_TIMEOUT_SECS: u64 = 10;
+const AUTH_REJECTION_RECHECK_SECS: u64 = 15 * 60;
 const CODEX_KEYRING_SERVICE: &str = "Codex Auth";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_USER_QUOTA_URL: &str =
@@ -41,6 +46,12 @@ pub enum PollError {
     TokenExpired,
     RateLimited(Option<u32>),
     RequestFailed,
+}
+
+#[derive(Debug)]
+pub struct PollFailure {
+    pub error: PollError,
+    pub data: Box<AppUsageData>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +97,15 @@ struct ClaudePollState {
 }
 
 static CLAUDE_POLL_STATE: OnceLock<Mutex<ClaudePollState>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct AuthRejectionBackoff {
+    token_hash: u64,
+    retry_at: Instant,
+}
+
+static CODEX_AUTH_REJECTION: OnceLock<Mutex<Option<AuthRejectionBackoff>>> = OnceLock::new();
+static ANTIGRAVITY_AUTH_REJECTION: OnceLock<Mutex<Option<AuthRejectionBackoff>>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct CodexAuthFile {
@@ -233,7 +253,7 @@ pub fn poll(
     show_codex: bool,
     show_antigravity: bool,
     force_claude_refresh: bool,
-) -> Result<AppUsageData, PollError> {
+) -> Result<AppUsageData, PollFailure> {
     poll_with(
         show_claude_code,
         show_codex,
@@ -248,16 +268,30 @@ fn poll_with(
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
-    mut poll_claude_code: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_codex: impl FnMut() -> Result<UsageData, PollError>,
-    mut poll_antigravity: impl FnMut() -> Result<UsageData, PollError>,
-) -> Result<AppUsageData, PollError> {
+    poll_claude_code: impl FnOnce() -> Result<UsageData, PollError> + Send,
+    poll_codex: impl FnOnce() -> Result<UsageData, PollError> + Send,
+    poll_antigravity: impl FnOnce() -> Result<UsageData, PollError> + Send,
+) -> Result<AppUsageData, PollFailure> {
+    // Fetch the enabled providers concurrently: results reach the UI only
+    // once the whole pass finishes, so a slow endpoint would otherwise hold
+    // back every other provider's fresh numbers for its full duration.
+    let (claude_code, codex, antigravity) = std::thread::scope(|scope| {
+        let claude_code = show_claude_code.then(|| scope.spawn(poll_claude_code));
+        let codex = show_codex.then(|| scope.spawn(poll_codex));
+        let antigravity = show_antigravity.then(|| scope.spawn(poll_antigravity));
+        (
+            claude_code.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
+            codex.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
+            antigravity.map(|handle| handle.join().unwrap_or(Err(PollError::RequestFailed))),
+        )
+    });
+
     let mut data = AppUsageData::default();
-    let mut first_error = None;
+    let mut errors = Vec::new();
     let active_provider_count = show_claude_code as u8 + show_codex as u8 + show_antigravity as u8;
 
-    if show_claude_code {
-        match poll_claude_code() {
+    if let Some(result) = claude_code {
+        match result {
             Ok(claude_code) => data.claude_code = Some(claude_code),
             Err(error) => {
                 if active_provider_count > 1 {
@@ -265,13 +299,13 @@ fn poll_with(
                 }
                 data.claude_code_error = Some(provider_status(error));
                 record_poll_error(&mut data, error);
-                first_error.get_or_insert(error);
+                errors.push(error);
             }
         }
     }
 
-    if show_codex {
-        match poll_codex() {
+    if let Some(result) = codex {
+        match result {
             Ok(codex) => data.codex = Some(codex),
             Err(error) => {
                 if active_provider_count > 1 {
@@ -279,13 +313,13 @@ fn poll_with(
                 }
                 data.codex_error = Some(provider_status(error));
                 record_poll_error(&mut data, error);
-                first_error.get_or_insert(error);
+                errors.push(error);
             }
         }
     }
 
-    if show_antigravity {
-        match poll_antigravity() {
+    if let Some(result) = antigravity {
+        match result {
             Ok(antigravity) => data.antigravity = Some(antigravity),
             Err(error) => {
                 if active_provider_count > 1 {
@@ -293,15 +327,53 @@ fn poll_with(
                 }
                 data.antigravity_error = Some(provider_status(error));
                 record_poll_error(&mut data, error);
-                first_error.get_or_insert(error);
+                errors.push(error);
             }
         }
     }
 
     if data.claude_code.is_none() && data.codex.is_none() && data.antigravity.is_none() {
-        Err(first_error.unwrap_or(PollError::RequestFailed))
+        Err(PollFailure {
+            error: aggregate_poll_errors(&errors),
+            data: Box::new(data),
+        })
     } else {
         Ok(data)
+    }
+}
+
+fn aggregate_poll_errors(errors: &[PollError]) -> PollError {
+    let Some(&first) = errors.first() else {
+        return PollError::RequestFailed;
+    };
+    if errors.len() == 1 {
+        return first;
+    }
+
+    let all_require_user_action = errors.iter().all(|error| {
+        matches!(
+            error,
+            PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired
+        )
+    });
+    if all_require_user_action {
+        return first;
+    }
+
+    let retry_after_ms = errors
+        .iter()
+        .filter_map(|error| match error {
+            PollError::RateLimited(value) => *value,
+            _ => None,
+        })
+        .max();
+    if errors
+        .iter()
+        .any(|error| matches!(error, PollError::RateLimited(_)))
+    {
+        PollError::RateLimited(retry_after_ms)
+    } else {
+        PollError::RequestFailed
     }
 }
 
@@ -358,7 +430,53 @@ fn claude_cache_is_fresh(
     let Ok(age) = now.duration_since(cached.fetched_at) else {
         return false;
     };
+    // A snapshot taken before a window's reset goes stale the moment that
+    // reset passes: the server reports the refilled window while the cache
+    // would keep showing it exhausted for up to a full cadence. This cannot
+    // loop against a lagging server: a confirming fetch whose reply still
+    // carries the old reset time re-caches with fetched_at past that reset.
+    let reset_elapsed = cached.data.windows.iter().any(
+        |window| matches!(window.resets_at, Some(reset) if reset > cached.fetched_at && now >= reset),
+    );
+    if reset_elapsed {
+        return false;
+    }
     age < Duration::from_millis(claude_poll_interval_ms(cached))
+}
+
+/// Padding past the exact cooldown deadline so the aligned tick's fetch
+/// cannot land a few milliseconds early and be served from the cache.
+const CLAUDE_ALIGN_MARGIN_MS: u64 = 250;
+/// Floor for an aligned tick so an overdue deadline never arms a zero-delay
+/// timer loop.
+const CLAUDE_ALIGN_MIN_DELAY_MS: u64 = 1_000;
+
+/// Delay until the next poll tick should fire so the Claude fetch lands right
+/// at its cache-cooldown deadline (180s/120s after the previous fetch).
+/// Without this the deadline falls between fixed ticks and the observed
+/// cadence stretches by up to one user poll interval. Returns None when the
+/// fixed schedule should own the timer: no cached data yet, a rate-limit
+/// backoff pending, or a user cadence at least as coarse as the cooldown
+/// (every tick fetches then, so there is nothing to align).
+pub fn claude_aligned_poll_delay_ms(poll_interval_ms: u32) -> Option<u32> {
+    let state = claude_poll_state().lock().ok()?;
+    if state.rate_limit.is_some() {
+        return None;
+    }
+    let cached = state.cached.as_ref()?;
+    let age = SystemTime::now().duration_since(cached.fetched_at).ok()?;
+    aligned_poll_delay_ms(poll_interval_ms, claude_poll_interval_ms(cached), age)
+}
+
+fn aligned_poll_delay_ms(poll_interval_ms: u32, cadence_ms: u64, age: Duration) -> Option<u32> {
+    if u64::from(poll_interval_ms) >= cadence_ms {
+        return None;
+    }
+    let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
+    let due_ms = cadence_ms
+        .saturating_sub(age_ms)
+        .saturating_add(CLAUDE_ALIGN_MARGIN_MS);
+    Some(due_ms.clamp(CLAUDE_ALIGN_MIN_DELAY_MS, u64::from(poll_interval_ms)) as u32)
 }
 
 fn cached_claude_usage(token_hash: u64, force_refresh: bool) -> Option<UsageData> {
@@ -513,9 +631,19 @@ fn poll_codex() -> Result<UsageData, PollError> {
         }
     };
 
+    let token_hash = token_hash(&creds.access_token);
+    if auth_rejection_is_backed_off(&CODEX_AUTH_REJECTION, token_hash) {
+        diagnose::log("Codex usage poll skipped; rejected credentials have not changed");
+        return Err(PollError::AuthRequired);
+    }
+
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
-        Ok(data) => Ok(data),
+        Ok(data) => {
+            clear_auth_rejection(&CODEX_AUTH_REJECTION);
+            Ok(data)
+        }
         Err(PollError::AuthRequired) => {
+            record_auth_rejection(&CODEX_AUTH_REJECTION, token_hash);
             diagnose::log(
                 "Codex usage endpoint returned auth required; automatic CLI refresh is disabled because it would require running a model-capable Codex command.",
             );
@@ -533,7 +661,61 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
         }
     };
 
-    fetch_antigravity_usage(&creds.access_token)
+    let token_hash = token_hash(&creds.access_token);
+    if auth_rejection_is_backed_off(&ANTIGRAVITY_AUTH_REJECTION, token_hash) {
+        diagnose::log("Antigravity usage poll skipped; rejected credentials have not changed");
+        return Err(PollError::AuthRequired);
+    }
+
+    match fetch_antigravity_usage(&creds.access_token) {
+        Ok(data) => {
+            clear_auth_rejection(&ANTIGRAVITY_AUTH_REJECTION);
+            Ok(data)
+        }
+        Err(PollError::AuthRequired) => {
+            record_auth_rejection(&ANTIGRAVITY_AUTH_REJECTION, token_hash);
+            Err(PollError::AuthRequired)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn auth_rejection_is_backed_off(
+    state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>,
+    token_hash: u64,
+) -> bool {
+    let Some(state) = state.get() else {
+        return false;
+    };
+    let Ok(mut rejection) = state.lock() else {
+        return false;
+    };
+    match *rejection {
+        Some(value) if value.token_hash == token_hash && Instant::now() < value.retry_at => true,
+        Some(_) => {
+            *rejection = None;
+            false
+        }
+        None => false,
+    }
+}
+
+fn record_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>, token_hash: u64) {
+    let state = state.get_or_init(|| Mutex::new(None));
+    if let Ok(mut rejection) = state.lock() {
+        *rejection = Some(AuthRejectionBackoff {
+            token_hash,
+            retry_at: Instant::now() + Duration::from_secs(AUTH_REJECTION_RECHECK_SECS),
+        });
+    }
+}
+
+fn clear_auth_rejection(state: &OnceLock<Mutex<Option<AuthRejectionBackoff>>>) {
+    if let Some(state) = state.get() {
+        if let Ok(mut rejection) = state.lock() {
+            *rejection = None;
+        }
+    }
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -575,9 +757,13 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
+    build_agent_with_timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
+}
+
+fn build_agent_with_timeout(timeout: Duration) -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout)
         .tls_connector(std::sync::Arc::new(tls))
         .build())
 }
@@ -841,8 +1027,72 @@ fn parse_retry_after_http_date(value: &str) -> Option<u64> {
     parse_datetime_to_unix(&format!("{year:04}-{month:02}-{day:02}T{}", parts[4])).ok()
 }
 
+enum CodexAttemptError {
+    Retryable(PollError),
+    Final(PollError),
+}
+
+impl CodexAttemptError {
+    fn poll_error(self) -> PollError {
+        match self {
+            Self::Retryable(error) | Self::Final(error) => error,
+        }
+    }
+}
+
+fn codex_http_status_is_retryable(code: u16) -> bool {
+    matches!(code, 502..=504)
+}
+
 fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
+    let agent = build_agent_with_timeout(Duration::from_secs(CODEX_REQUEST_TIMEOUT_SECS))?;
+    fetch_codex_usage_with_retry(
+        || fetch_codex_usage_once(&agent, token, account_id),
+        || std::thread::sleep(Duration::from_millis(CODEX_RETRY_DELAY_MS)),
+    )
+}
+
+fn fetch_codex_usage_with_retry(
+    mut fetch_once: impl FnMut() -> Result<UsageData, CodexAttemptError>,
+    mut retry_wait: impl FnMut(),
+) -> Result<UsageData, PollError> {
+    let started = Instant::now();
+    match fetch_once() {
+        Ok(data) => Ok(data),
+        Err(CodexAttemptError::Final(error)) => Err(error),
+        Err(CodexAttemptError::Retryable(_)) => {
+            diagnose::log(format!(
+                "Codex usage endpoint transient failure after {}ms; retrying once in {}ms",
+                started.elapsed().as_millis(),
+                CODEX_RETRY_DELAY_MS
+            ));
+            retry_wait();
+            match fetch_once() {
+                Ok(data) => {
+                    diagnose::log(format!(
+                        "Codex usage endpoint recovered on retry; total_elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    ));
+                    Ok(data)
+                }
+                Err(error) => {
+                    let error = error.poll_error();
+                    diagnose::log(format!(
+                        "Codex usage endpoint retry failed; total_elapsed_ms={} error={error:?}",
+                        started.elapsed().as_millis()
+                    ));
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+fn fetch_codex_usage_once(
+    agent: &ureq::Agent,
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<UsageData, CodexAttemptError> {
     let mut request = agent
         .get(CODEX_USAGE_URL)
         .set("Authorization", &format!("Bearer {token}"))
@@ -855,15 +1105,16 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
     let resp = match request.call() {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, response)) => {
-            return Err(http_status_poll_error(
-                "Codex usage endpoint",
-                code,
-                &response,
-            ));
+            let error = http_status_poll_error("Codex usage endpoint", code, &response);
+            return Err(if codex_http_status_is_retryable(code) {
+                CodexAttemptError::Retryable(error)
+            } else {
+                CodexAttemptError::Final(error)
+            });
         }
         Err(error) => {
             diagnose::log_error("Codex usage endpoint request failed", error);
-            return Err(PollError::RequestFailed);
+            return Err(CodexAttemptError::Retryable(PollError::RequestFailed));
         }
     };
 
@@ -871,11 +1122,14 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         Ok(response) => response,
         Err(error) => {
             diagnose::log_error("unable to parse Codex usage response", error);
-            return Err(PollError::RequestFailed);
+            return Err(CodexAttemptError::Final(PollError::RequestFailed));
         }
     };
 
-    codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+    codex_usage_from_response(response).ok_or_else(|| {
+        diagnose::log("Codex usage response did not contain a usable quota window");
+        CodexAttemptError::Final(PollError::RequestFailed)
+    })
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
@@ -917,43 +1171,26 @@ fn antigravity_credential_watch_signature() -> String {
 }
 
 fn fetch_antigravity_usage(token: &str) -> Result<UsageData, PollError> {
-    let mut auth_error = false;
-    let mut last_error = PollError::RequestFailed;
-    let mut retry_after_ms = None;
-    let mut saw_rate_limit = false;
+    let mut errors = Vec::new();
 
     for base_url in ANTIGRAVITY_ENDPOINTS {
         match fetch_antigravity_usage_from_endpoint(base_url, token) {
             Ok(data) => return Ok(data),
-            Err(PollError::AuthRequired) => auth_error = true,
-            Err(PollError::RateLimited(value)) => {
-                saw_rate_limit = true;
-                if let Some(value) = value {
-                    retry_after_ms =
-                        Some(retry_after_ms.map_or(value, |current: u32| current.max(value)));
-                }
-                last_error = PollError::RateLimited(retry_after_ms);
-            }
-            Err(error) => last_error = error,
+            Err(error) => errors.push(error),
         }
     }
 
-    if auth_error {
-        Err(PollError::AuthRequired)
-    } else if saw_rate_limit {
-        Err(PollError::RateLimited(retry_after_ms))
-    } else {
-        Err(last_error)
-    }
+    Err(aggregate_poll_errors(&errors))
 }
 
 fn fetch_antigravity_usage_from_endpoint(
     base_url: &str,
     token: &str,
 ) -> Result<UsageData, PollError> {
-    let project = fetch_antigravity_project(base_url, token)?;
+    let agent = build_agent_with_timeout(Duration::from_secs(ANTIGRAVITY_REQUEST_TIMEOUT_SECS))?;
+    let project = fetch_antigravity_project(&agent, base_url, token)?;
     if let Some(project) = project.as_deref() {
-        let per_model = match fetch_antigravity_user_quota(token, project) {
+        let per_model = match fetch_antigravity_user_quota(&agent, token, project) {
             Ok(data) if !data.is_empty() => Some(data),
             Ok(_) => None,
             Err(error) => {
@@ -963,7 +1200,7 @@ fn fetch_antigravity_usage_from_endpoint(
                 None
             }
         };
-        let summary = match fetch_antigravity_quota_summary(base_url, token, project) {
+        let summary = match fetch_antigravity_quota_summary(&agent, base_url, token, project) {
             Ok(data) if !data.is_empty() => Some(data),
             Ok(_) => None,
             Err(error) => {
@@ -979,12 +1216,15 @@ fn fetch_antigravity_usage_from_endpoint(
         }
     }
 
-    let window = fetch_antigravity_model_quota(base_url, token, project.as_deref())?;
+    let window = fetch_antigravity_model_quota(&agent, base_url, token, project.as_deref())?;
     Ok(UsageData::from_windows(vec![window]))
 }
 
-fn fetch_antigravity_user_quota(token: &str, project: &str) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
+fn fetch_antigravity_user_quota(
+    agent: &ureq::Agent,
+    token: &str,
+    project: &str,
+) -> Result<UsageData, PollError> {
     let body = serde_json::json!({ "project": project });
 
     let resp = match agent
@@ -1022,8 +1262,11 @@ fn fetch_antigravity_user_quota(token: &str, project: &str) -> Result<UsageData,
     Ok(antigravity_usage_from_user_quota(response).unwrap_or_default())
 }
 
-fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<String>, PollError> {
-    let agent = build_agent()?;
+fn fetch_antigravity_project(
+    agent: &ureq::Agent,
+    base_url: &str,
+    token: &str,
+) -> Result<Option<String>, PollError> {
     let body = serde_json::json!({
         "metadata": {
             "ideType": "ANTIGRAVITY"
@@ -1063,11 +1306,11 @@ fn fetch_antigravity_project(base_url: &str, token: &str) -> Result<Option<Strin
 }
 
 fn fetch_antigravity_model_quota(
+    agent: &ureq::Agent,
     base_url: &str,
     token: &str,
     project: Option<&str>,
 ) -> Result<UsageWindow, PollError> {
-    let agent = build_agent()?;
     let body = match project {
         Some(project) => serde_json::json!({ "project": project }),
         None => serde_json::json!({}),
@@ -1116,11 +1359,11 @@ fn fetch_antigravity_model_quota(
 }
 
 fn fetch_antigravity_quota_summary(
+    agent: &ureq::Agent,
     base_url: &str,
     token: &str,
     project: &str,
 ) -> Result<UsageData, PollError> {
-    let agent = build_agent()?;
     let body = serde_json::json!({ "project": project });
 
     let resp = match agent
@@ -1913,6 +2156,61 @@ mod tests {
     }
 
     #[test]
+    fn codex_retries_only_transient_gateway_statuses() {
+        assert!(codex_http_status_is_retryable(502));
+        assert!(codex_http_status_is_retryable(503));
+        assert!(codex_http_status_is_retryable(504));
+        assert!(!codex_http_status_is_retryable(401));
+        assert!(!codex_http_status_is_retryable(403));
+        assert!(!codex_http_status_is_retryable(429));
+        assert!(!codex_http_status_is_retryable(500));
+    }
+
+    #[test]
+    fn codex_transient_failure_retries_once_and_recovers() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u8);
+        let waits = Cell::new(0_u8);
+        let data = fetch_codex_usage_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() == 1 {
+                    Err(CodexAttemptError::Retryable(PollError::RequestFailed))
+                } else {
+                    Ok(usage_with_percent(42.0))
+                }
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .expect("second Codex attempt should recover");
+
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(waits.get(), 1);
+        assert_eq!(data.windows[0].percentage, 42.0);
+    }
+
+    #[test]
+    fn codex_final_failure_is_not_retried() {
+        use std::cell::Cell;
+
+        let attempts = Cell::new(0_u8);
+        let waits = Cell::new(0_u8);
+        let error = fetch_codex_usage_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(CodexAttemptError::Final(PollError::AuthRequired))
+            },
+            || waits.set(waits.get() + 1),
+        )
+        .expect_err("auth failures must not be retried");
+
+        assert_eq!(error, PollError::AuthRequired);
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(waits.get(), 0);
+    }
+
+    #[test]
     fn retry_after_accepts_seconds_and_caps_large_values() {
         assert_eq!(retry_after_value_ms("120", UNIX_EPOCH), Some(120_000));
         assert_eq!(
@@ -2017,6 +2315,77 @@ mod tests {
         assert!(!claude_cache_is_fresh(&normal_fresh, 7, true, now));
     }
 
+    fn cached_usage_with_reset(fetched_at: SystemTime, resets_at: SystemTime) -> CachedClaudeUsage {
+        CachedClaudeUsage {
+            token_hash: 7,
+            fetched_at,
+            data: UsageData::from_windows(vec![UsageWindow::new(
+                90.0,
+                Some(resets_at),
+                Some(FIVE_HOURS_SECONDS),
+            )]),
+            fast_polls_remaining: 0,
+        }
+    }
+
+    #[test]
+    fn claude_cache_goes_stale_once_a_cached_window_reset_passes() {
+        let now = UNIX_EPOCH + Duration::from_secs(10_000);
+        let fetched_at = now.checked_sub(Duration::from_secs(60)).unwrap();
+
+        // Snapshot taken before the reset, reset has passed: stale even
+        // though the cadence deadline is still 120s away.
+        let past_reset = cached_usage_with_reset(
+            fetched_at,
+            now.checked_sub(Duration::from_secs(10)).unwrap(),
+        );
+        assert!(!claude_cache_is_fresh(&past_reset, 7, false, now));
+
+        // Reset still ahead: the normal cadence owns freshness.
+        let upcoming_reset = cached_usage_with_reset(
+            fetched_at,
+            now.checked_add(Duration::from_secs(600)).unwrap(),
+        );
+        assert!(claude_cache_is_fresh(&upcoming_reset, 7, false, now));
+
+        // Server still reporting a reset older than the snapshot (lagging
+        // propagation): no re-fetch loop, the cadence owns freshness again.
+        let lagging_reset = cached_usage_with_reset(
+            fetched_at,
+            fetched_at.checked_sub(Duration::from_secs(10)).unwrap(),
+        );
+        assert!(claude_cache_is_fresh(&lagging_reset, 7, false, now));
+    }
+
+    #[test]
+    fn aligned_poll_delay_pulls_the_tick_to_the_cooldown_deadline() {
+        // Deadline between fixed ticks: align to it (plus the fetch margin).
+        assert_eq!(
+            aligned_poll_delay_ms(60_000, 180_000, Duration::from_secs(130)),
+            Some(50_250)
+        );
+        // Deadline beyond the next fixed tick: keep the fixed cadence.
+        assert_eq!(
+            aligned_poll_delay_ms(60_000, 180_000, Duration::from_secs(30)),
+            Some(60_000)
+        );
+        // Deadline already passed: fire after the minimum delay, not 0ms.
+        assert_eq!(
+            aligned_poll_delay_ms(60_000, 180_000, Duration::from_secs(200)),
+            Some(1_000)
+        );
+        // User cadence at least as coarse as the cooldown: nothing to align,
+        // every fixed tick fetches anyway.
+        assert_eq!(
+            aligned_poll_delay_ms(300_000, 180_000, Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            aligned_poll_delay_ms(120_000, 120_000, Duration::from_secs(30)),
+            None
+        );
+    }
+
     #[test]
     fn claude_usage_growth_arms_three_fast_follow_up_polls() {
         let previous = cached_claude_usage_for_test(10.0, SystemTime::now(), 0);
@@ -2051,6 +2420,38 @@ mod tests {
             claude_rate_limit_delay_ms(Some(u32::MAX)),
             CLAUDE_RATE_LIMIT_MAX_RETRY_MS
         );
+    }
+
+    #[test]
+    fn enabled_providers_are_polled_concurrently() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let rendezvous = Arc::new((Mutex::new(0_u8), Condvar::new()));
+        let make_poll = |percentage| {
+            let rendezvous = Arc::clone(&rendezvous);
+            move || {
+                let (lock, ready) = &*rendezvous;
+                let mut started = lock.lock().expect("provider rendezvous lock should work");
+                *started += 1;
+                ready.notify_all();
+                let (started, wait) = ready
+                    .wait_timeout_while(started, Duration::from_secs(5), |started| *started < 2)
+                    .expect("provider rendezvous wait should work");
+                if wait.timed_out() {
+                    return Err(PollError::RequestFailed);
+                }
+                drop(started);
+                Ok(usage_with_percent(percentage))
+            }
+        };
+
+        let data = poll_with(true, true, false, make_poll(11.0), make_poll(22.0), || {
+            unreachable!("antigravity is disabled")
+        })
+        .expect("both concurrent providers should succeed");
+
+        assert_eq!(data.claude_code.unwrap().windows[0].percentage, 11.0);
+        assert_eq!(data.codex.unwrap().windows[0].percentage, 22.0);
     }
 
     #[test]
@@ -2106,8 +2507,8 @@ mod tests {
         assert_eq!(data.rate_limit_retry_after_ms, Some(120_000));
     }
     #[test]
-    fn returns_first_error_when_no_enabled_provider_succeeds() {
-        let error = poll_with(
+    fn mixed_all_provider_failure_does_not_claim_every_provider_needs_login() {
+        let failure = poll_with(
             true,
             true,
             true,
@@ -2117,7 +2518,79 @@ mod tests {
         )
         .expect_err("all-provider failure should return an error");
 
-        assert_eq!(error, PollError::AuthRequired);
+        assert_eq!(failure.error, PollError::RequestFailed);
+        assert_eq!(
+            failure.data.claude_code_error,
+            Some(ProviderStatus::AuthRequired)
+        );
+        assert_eq!(
+            failure.data.codex_error,
+            Some(ProviderStatus::RequestFailed)
+        );
+        assert_eq!(
+            failure.data.antigravity_error,
+            Some(ProviderStatus::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn all_provider_auth_failures_still_require_login() {
+        let failure = poll_with(
+            true,
+            true,
+            true,
+            || Err(PollError::AuthRequired),
+            || Err(PollError::NoCredentials),
+            || Err(PollError::TokenExpired),
+        )
+        .expect_err("all-provider authentication failure should return an error");
+
+        assert!(matches!(
+            failure.error,
+            PollError::AuthRequired | PollError::NoCredentials | PollError::TokenExpired
+        ));
+    }
+
+    #[test]
+    fn alternative_endpoint_auth_error_needs_consensus_before_login_is_required() {
+        assert_eq!(
+            aggregate_poll_errors(&[
+                PollError::AuthRequired,
+                PollError::RequestFailed,
+                PollError::RequestFailed,
+            ]),
+            PollError::RequestFailed
+        );
+        assert_eq!(
+            aggregate_poll_errors(&[
+                PollError::AuthRequired,
+                PollError::AuthRequired,
+                PollError::AuthRequired,
+            ]),
+            PollError::AuthRequired
+        );
+        assert_eq!(
+            aggregate_poll_errors(&[
+                PollError::AuthRequired,
+                PollError::RateLimited(Some(120_000)),
+                PollError::RequestFailed,
+            ]),
+            PollError::RateLimited(Some(120_000))
+        );
+    }
+
+    #[test]
+    fn rejected_credential_backoff_clears_for_a_new_token_or_success() {
+        let state = OnceLock::new();
+
+        assert!(!auth_rejection_is_backed_off(&state, 11));
+        record_auth_rejection(&state, 11);
+        assert!(auth_rejection_is_backed_off(&state, 11));
+        assert!(!auth_rejection_is_backed_off(&state, 22));
+
+        record_auth_rejection(&state, 22);
+        clear_auth_rejection(&state);
+        assert!(!auth_rejection_is_backed_off(&state, 22));
     }
 
     #[test]

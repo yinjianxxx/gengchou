@@ -196,6 +196,7 @@ pub(crate) fn layout_badges(
             Attention::Warn => selected
                 .filter(|window| !window.countdown.is_empty())
                 .map(|window| window.countdown.as_str()),
+            Attention::Degraded => Some("~"),
             Attention::Error => Some("!"),
             Attention::Normal => None,
         };
@@ -316,10 +317,12 @@ pub(crate) fn layout_badges(
                 font: FontKey::Data12,
                 color: if quota_warn {
                     ColorKey::PillAlertText
-                } else if provider.attention == Attention::Error {
-                    ColorKey::ErrorText
                 } else {
-                    ColorKey::PillAlertText
+                    match provider.attention {
+                        Attention::Error => ColorKey::ErrorText,
+                        Attention::Degraded | Attention::Warn => ColorKey::PillAlertText,
+                        Attention::Normal => ColorKey::PillText,
+                    }
                 },
             });
         }
@@ -396,7 +399,12 @@ pub(crate) fn layout_provider_rows(
             });
         }
         let identity_right = chip_x + identity_w;
-        let status_space = if provider.attention == Attention::Error {
+        let status = match provider.attention {
+            Attention::Degraded => Some(("~", ColorKey::PillAlertText)),
+            Attention::Error => Some(("!", ColorKey::ErrorText)),
+            Attention::Normal | Attention::Warn => None,
+        };
+        let status_space = if let Some((status, color)) = status {
             let status_x = identity_right + m.status_gap;
             cmds.push(DrawCmd::Text {
                 rect: Rect {
@@ -405,9 +413,9 @@ pub(crate) fn layout_provider_rows(
                     w: m.status_w,
                     h: m.floating_h,
                 },
-                text: "!".to_string(),
+                text: status.to_string(),
                 font: FontKey::Data12,
-                color: ColorKey::ErrorText,
+                color,
             });
             m.status_gap + m.status_w
         } else {
@@ -682,6 +690,12 @@ mod tests {
             false,
             &fake_measure,
         );
+        let degraded = layout_badges(
+            &model(Attention::Degraded, Severity::Normal),
+            &m,
+            false,
+            &fake_measure,
+        );
         let error = layout_badges(
             &model(Attention::Error, Severity::Normal),
             &m,
@@ -691,6 +705,10 @@ mod tests {
         assert_eq!(
             warn.width - normal.width,
             m.badge_text_gap + fake_measure(FontKey::Data12, "\u{00b7}4d")
+        );
+        assert_eq!(
+            degraded.width - normal.width,
+            m.badge_text_gap + fake_measure(FontKey::Data12, "~")
         );
         assert_eq!(
             error.width - normal.width,
@@ -784,6 +802,35 @@ mod tests {
         let label = label.unwrap();
         assert!(chip.x + chip.w <= marker.x);
         assert!(marker.x + marker.w <= label.x);
+    }
+
+    #[test]
+    fn degraded_provider_uses_a_subtle_marker_on_both_compact_surfaces() {
+        let m = Metrics::logical();
+        let model = CompactViewModel {
+            providers: vec![provider(
+                TrayIconKind::Codex,
+                vec![window("7d", 51.0, "\u{00b7}6d", Severity::Normal)],
+                Attention::Degraded,
+            )],
+        };
+
+        for scene in [
+            layout_badges(&model, &m, false, &fake_measure),
+            layout_provider_rows(&model, &m, false, &fake_measure),
+        ] {
+            assert!(scene.cmds.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::Text { text, color: ColorKey::PillAlertText, .. } if text == "~"
+            )));
+            assert!(!scene.cmds.iter().any(|cmd| matches!(
+                cmd,
+                DrawCmd::Text {
+                    color: ColorKey::ErrorText,
+                    ..
+                }
+            )));
+        }
     }
 
     #[test]

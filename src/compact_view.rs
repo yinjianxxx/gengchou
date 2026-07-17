@@ -21,6 +21,7 @@ pub(crate) enum Severity {
 pub(crate) enum Attention {
     Normal,
     Warn,
+    Degraded,
     Error,
 }
 
@@ -181,15 +182,16 @@ fn provider_view(
         })
         .unwrap_or_default();
     let placeholder = windows.is_empty().then(|| "--".to_string());
-    let attention = if error.is_some() {
-        Attention::Error
-    } else if windows
-        .iter()
-        .any(|window| window.severity == Severity::Warn)
-    {
-        Attention::Warn
-    } else {
-        Attention::Normal
+    let attention = match error {
+        Some(ProviderStatus::RateLimited | ProviderStatus::RequestFailed) => Attention::Degraded,
+        Some(ProviderStatus::AuthRequired) => Attention::Error,
+        None if windows
+            .iter()
+            .any(|window| window.severity == Severity::Warn) =>
+        {
+            Attention::Warn
+        }
+        None => Attention::Normal,
     };
     ProviderView {
         kind,
@@ -373,8 +375,16 @@ mod tests {
             ..Default::default()
         };
         let vm = build(Some(&cached), strings, &ORDER, false, true, false);
-        assert_eq!(vm.providers[0].attention, Attention::Error);
+        assert_eq!(vm.providers[0].attention, Attention::Degraded);
         assert_eq!(vm.providers[0].windows[0].percent_text, "51%");
+
+        let transient = AppUsageData {
+            codex_error: Some(ProviderStatus::RequestFailed),
+            ..Default::default()
+        };
+        let vm = build(Some(&transient), strings, &ORDER, false, true, false);
+        assert_eq!(vm.providers[0].attention, Attention::Degraded);
+        assert_eq!(vm.providers[0].placeholder.as_deref(), Some("--"));
 
         let unavailable = AppUsageData {
             codex_error: Some(ProviderStatus::AuthRequired),
