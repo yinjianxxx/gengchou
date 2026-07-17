@@ -57,7 +57,6 @@ pub struct PollFailure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
     ActiveSource,
-    AllSources,
     Codex,
     Antigravity,
     AllProviders,
@@ -771,7 +770,6 @@ fn build_agent_with_timeout(timeout: Duration) -> Result<ureq::Agent, PollError>
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     let mut snapshot = match mode {
         CredentialWatchMode::ActiveSource => claude_credential_watch_snapshot(true),
-        CredentialWatchMode::AllSources => claude_credential_watch_snapshot(false),
         CredentialWatchMode::Codex => vec![codex_credential_watch_signature()],
         CredentialWatchMode::Antigravity => vec![antigravity_credential_watch_signature()],
         CredentialWatchMode::AllProviders => {
@@ -1851,7 +1849,46 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
     None
 }
 
+/// Installed distros change about as often as Windows itself, but every
+/// credential read and watch snapshot re-ran `wsl.exe -l -q`. That spawn
+/// costs the full 5s timeout whenever WSL is absent or broken (a common
+/// setup: it fails with REGDB_E_CLASSNOTREG), and the enumeration happens on
+/// the UI thread during the auth-error watch. Cache it, including the
+/// failure, so a stalled WSL cannot be paid for on every tick.
+const WSL_DISTRO_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct WslDistroCache {
+    fetched_at: Instant,
+    distros: Vec<String>,
+}
+
+fn wsl_cache_is_fresh(entry: &WslDistroCache, now: Instant) -> bool {
+    now.duration_since(entry.fetched_at) < WSL_DISTRO_CACHE_TTL
+}
+
+static WSL_DISTRO_CACHE: OnceLock<Mutex<Option<WslDistroCache>>> = OnceLock::new();
+
 fn list_wsl_distros() -> Vec<String> {
+    let cache = WSL_DISTRO_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(cached) = cache.lock() {
+        if let Some(entry) = cached.as_ref() {
+            if wsl_cache_is_fresh(entry, Instant::now()) {
+                return entry.distros.clone();
+            }
+        }
+    }
+
+    let distros = enumerate_wsl_distros();
+    if let Ok(mut cached) = cache.lock() {
+        *cached = Some(WslDistroCache {
+            fetched_at: Instant::now(),
+            distros: distros.clone(),
+        });
+    }
+    distros
+}
+
+fn enumerate_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
         Command::new("wsl.exe")
             .args(["-l", "-q"])
@@ -2929,6 +2966,28 @@ mod tests {
         assert_eq!(parse_iso8601(Some("2026-03-05T08:00:00+02:00")), utc);
         assert_eq!(parse_iso8601(Some("2026-03-05T01:00:00-05:00")), utc);
         assert_eq!(parse_iso8601(Some("2026-03-05T08:00:00+0200")), utc);
+    }
+
+    #[test]
+    fn wsl_distro_cache_serves_within_ttl_and_expires_after() {
+        // Enumerating WSL costs a process spawn - and a full 5s timeout when
+        // WSL is absent or broken - so a fresh entry must be reused rather
+        // than re-probed on every credential read.
+        let now = Instant::now();
+        let entry = WslDistroCache {
+            fetched_at: now,
+            distros: vec!["Ubuntu".to_string()],
+        };
+        assert!(wsl_cache_is_fresh(&entry, now));
+        assert!(wsl_cache_is_fresh(
+            &entry,
+            now + WSL_DISTRO_CACHE_TTL - Duration::from_secs(1)
+        ));
+        assert!(!wsl_cache_is_fresh(&entry, now + WSL_DISTRO_CACHE_TTL));
+        assert!(!wsl_cache_is_fresh(
+            &entry,
+            now + WSL_DISTRO_CACHE_TTL + Duration::from_secs(1)
+        ));
     }
 
     #[test]
