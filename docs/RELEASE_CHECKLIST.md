@@ -25,8 +25,8 @@ with a short note in the release runbook.
 - Confirm taskbar widget, all enabled tray icons, detail popup, context menu,
   manual refresh, and clean Exit.
 - Confirm Refresh is one submenu whose first item is Now, followed by a
-  separator and the four checked polling intervals; exercise Now and each
-  interval once.
+  separator and the six checked polling intervals (1, 2, 5, 10, 15, and 30
+  minutes); exercise Now and each interval once.
 - Keep the detail popup open across a poll boundary and confirm Updated /
   next-in advances once per second without extra provider requests.
 - Drag the detail popup in its default movable state, lock it and confirm it no
