@@ -1027,10 +1027,15 @@ const DETAIL_HOVER_NONE: u8 = 0;
 const DETAIL_HOVER_REFRESH: u8 = 1;
 const DETAIL_HOVER_CLOSE: u8 = 2;
 const DETAIL_HOVER_MOVE: u8 = 3;
+const DETAIL_HOVER_PIN: u8 = 4;
 /// The popup starts movable every time it opens. Locking only lasts for this
 /// HWND's lifetime; its moved position is deliberately not persisted.
 const DETAIL_DEFAULT_MOVEMENT_UNLOCKED: bool = true;
 static DETAIL_MOVEMENT_UNLOCKED: AtomicBool = AtomicBool::new(DETAIL_DEFAULT_MOVEMENT_UNLOCKED);
+/// While pinned the popup survives focus loss; only Esc, the close button, or
+/// Exit dismiss it. Like the movement lock, the state lasts for one HWND.
+const DETAIL_DEFAULT_PINNED: bool = false;
+static DETAIL_PINNED: AtomicBool = AtomicBool::new(DETAIL_DEFAULT_PINNED);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WidgetTooltipRow {
@@ -2616,6 +2621,13 @@ fn show_usage_details(_tray_hwnd: HWND) {
         if let Some(detail_hwnd) = existing {
             if IsWindow(detail_hwnd).as_bool() {
                 let _dpi_scope = DpiScope::for_window(detail_hwnd);
+                if DETAIL_PINNED.load(Ordering::SeqCst) {
+                    // A pinned popup stays where the user put it; re-opening
+                    // must not snap it back to the anchor.
+                    let _ = InvalidateRect(detail_hwnd, None, false);
+                    let _ = SetForegroundWindow(detail_hwnd);
+                    return;
+                }
                 let (width, height) = detail_popup_size(&snapshot);
                 let (x, y) = detail_popup_position(width, height);
                 let _ = SetWindowPos(
@@ -2645,6 +2657,7 @@ fn show_usage_details(_tray_hwnd: HWND) {
         let (width, height) = detail_popup_size(&snapshot);
         let (x, y) = detail_popup_position(width, height);
         DETAIL_MOVEMENT_UNLOCKED.store(DETAIL_DEFAULT_MOVEMENT_UNLOCKED, Ordering::SeqCst);
+        DETAIL_PINNED.store(DETAIL_DEFAULT_PINNED, Ordering::SeqCst);
         let hinstance = match GetModuleHandleW(PCWSTR::null()) {
             Ok(handle) => handle,
             Err(error) => {
@@ -3929,6 +3942,8 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                 DETAIL_HOVER_REFRESH
             } else if point_in_rect(x, y, &detail_move_rect(width)) {
                 DETAIL_HOVER_MOVE
+            } else if point_in_rect(x, y, &detail_pin_rect(width)) {
+                DETAIL_HOVER_PIN
             } else {
                 DETAIL_HOVER_NONE
             };
@@ -3984,6 +3999,14 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
                     "detail popup: movement locked"
                 });
                 let _ = InvalidateRect(hwnd, None, false);
+            } else if point_in_rect(x, y, &detail_pin_rect(width)) {
+                let pinned = !DETAIL_PINNED.fetch_xor(true, Ordering::SeqCst);
+                diagnose::log(if pinned {
+                    "detail popup: pinned open"
+                } else {
+                    "detail popup: unpinned"
+                });
+                let _ = InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
@@ -4000,6 +4023,10 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             LRESULT(0)
         }
         WM_ACTIVATE if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE => {
+            if DETAIL_PINNED.load(Ordering::SeqCst) {
+                diagnose::log("detail popup: focus loss ignored while pinned");
+                return LRESULT(0);
+            }
             diagnose::log("detail popup: dismissed on focus loss");
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -4015,6 +4042,7 @@ unsafe fn detail_wnd_proc_impl(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
             }
             DETAIL_HOVER.store(DETAIL_HOVER_NONE, Ordering::SeqCst);
             DETAIL_MOVEMENT_UNLOCKED.store(DETAIL_DEFAULT_MOVEMENT_UNLOCKED, Ordering::SeqCst);
+            DETAIL_PINNED.store(DETAIL_DEFAULT_PINNED, Ordering::SeqCst);
             {
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
@@ -4625,6 +4653,15 @@ fn detail_move_rect(width: i32) -> RECT {
     }
 }
 
+fn detail_pin_rect(width: i32) -> RECT {
+    RECT {
+        left: width - sc(138),
+        top: sc(13),
+        right: width - sc(112),
+        bottom: sc(39),
+    }
+}
+
 fn detail_header_is_draggable(x: i32, y: i32, width: i32) -> bool {
     point_in_rect(
         x,
@@ -4632,7 +4669,7 @@ fn detail_header_is_draggable(x: i32, y: i32, width: i32) -> bool {
         &RECT {
             left: sc(4),
             top: sc(4),
-            right: detail_move_rect(width).left - sc(4),
+            right: detail_pin_rect(width).left - sc(4),
             bottom: sc(DETAIL_HEADER_H - 4),
         },
     )
@@ -4846,7 +4883,7 @@ fn paint_detail_content(
             RECT {
                 left: margin,
                 top: sc(14),
-                right: width - sc(116),
+                right: width - sc(148),
                 bottom: sc(40),
             },
             &palette.text,
@@ -4855,14 +4892,20 @@ fn paint_detail_content(
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
 
-        // Header buttons: temporary movement lock + refresh + close. Movement
-        // is enabled by default and never persisted between popup instances.
+        // Header buttons: pin + lock + refresh + close. The lock freezes the
+        // popup in place; the pin keeps it open across focus loss. Neither
+        // state is persisted between popup instances.
         let hover = DETAIL_HOVER.load(Ordering::SeqCst);
         let movement_unlocked = DETAIL_MOVEMENT_UNLOCKED.load(Ordering::SeqCst);
+        let pinned = DETAIL_PINNED.load(Ordering::SeqCst);
+        let pin_rect = detail_pin_rect(width);
         let move_rect = detail_move_rect(width);
         let refresh_rect = detail_refresh_rect(width);
         let close_rect = detail_close_rect(width);
         let movement_locked = !movement_unlocked;
+        if hover == DETAIL_HOVER_PIN || pinned {
+            draw_rounded_rect(hdc, &pin_rect, &palette.divider, sc(4));
+        }
         if hover == DETAIL_HOVER_MOVE || movement_locked {
             draw_rounded_rect(hdc, &move_rect, &palette.divider, sc(4));
         }
@@ -4872,6 +4915,21 @@ fn paint_detail_content(
         if hover == DETAIL_HOVER_CLOSE {
             draw_rounded_rect(hdc, &close_rect, &palette.divider, sc(4));
         }
+        // Segoe MDL2 Assets E718/E77A are the shell pin/unpin glyphs.
+        draw_detail_text_face(
+            hdc,
+            if pinned { "\u{E77A}" } else { "\u{E718}" },
+            pin_rect,
+            if hover == DETAIL_HOVER_PIN || pinned {
+                &palette.text
+            } else {
+                &palette.muted
+            },
+            "Segoe MDL2 Assets",
+            12,
+            FW_NORMAL.0 as i32,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
         // Segoe MDL2 Assets E72E/E785 are the shell lock/unlock glyphs.
         draw_detail_text_face(
             hdc,
@@ -11032,6 +11090,7 @@ mod reset_notification_tests {
         assert!(detail_header_is_draggable(sc(20), sc(20), width));
 
         for button in [
+            detail_pin_rect(width),
             detail_move_rect(width),
             detail_refresh_rect(width),
             detail_close_rect(width),
