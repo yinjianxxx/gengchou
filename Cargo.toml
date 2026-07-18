@@ -3,22 +3,22 @@ name = "gengchou"
 # Versioning starts at 2.x, above the original project's 1.x line: also
 # guarantees the manual update check never treats an upstream 1.x release as
 # newer (see updater::is_version_newer).
-version = "2.3.1"
+version = "2.3.2"
 edition = "2021"
 rust-version = "1.86"
 license = "MIT"
 description = "Gengchou — AI quota monitor for the Windows taskbar"
-homepage = "https://github.com/yinjianxxx/gengchou"
-repository = "https://github.com/yinjianxxx/gengchou"
+homepage = "https://github.com/ynjmxn/gengchou"
+repository = "https://github.com/ynjmxn/gengchou"
 
 [package.metadata.winres]
-CompanyName = "yinjianxxx"
+CompanyName = "ynjmxn"
 ProductName = "Gengchou"
 FileDescription = "Gengchou — AI quota monitor"
 OriginalFilename = "gengchou.exe"
 InternalName = "Gengchou"
 Comments = "Originally derived from CodeZeno/Claude-Code-Usage-Monitor"
-LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 yinjianxxx"
+LegalCopyright = "Copyright (C) 2025 Craig Constable; modifications Copyright (C) 2026 Jianxin Yin"
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }

@@ -11,6 +11,17 @@ $retiredTokens = @(
     ('AI' + 'UM_')
 )
 $grepPattern = ($retiredTokens | ForEach-Object { [regex]::Escape($_) }) -join '|'
+$retiredPublisherPattern = [regex]::Escape(('yin' + 'jianxxx'))
+
+$retiredPublisherResults = @(& git grep --untracked -n -i -E $retiredPublisherPattern -- .)
+$retiredPublisherExitCode = $LASTEXITCODE
+if ($retiredPublisherExitCode -notin @(0, 1)) {
+    throw "Retired publisher identity scan failed with exit code $retiredPublisherExitCode."
+}
+if ($retiredPublisherResults.Count -ne 0) {
+    $details = $retiredPublisherResults -join [Environment]::NewLine
+    throw "Retired publisher identity remains in the current tree:`n$details"
+}
 
 $grepResults = @(& git grep --untracked -n -E $grepPattern -- .)
 $grepExitCode = $LASTEXITCODE
@@ -100,4 +111,4 @@ if ($violations.Count -ne 0) {
     throw "Retired identity allowlist check failed:`n$details"
 }
 
-Write-Output "Retired identity allowlist check passed ($($grepResults.Count) historical lines)."
+Write-Output "Retired identity and publisher checks passed ($($grepResults.Count) historical lines)."

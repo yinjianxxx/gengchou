@@ -14,7 +14,7 @@ version once a fix is available.
 ## Reporting a vulnerability
 
 Please do not disclose a suspected vulnerability in a public issue. Use
-[GitHub's private vulnerability reporting form](https://github.com/yinjianxxx/gengchou/security/advisories/new)
+[GitHub's private vulnerability reporting form](https://github.com/ynjmxn/gengchou/security/advisories/new)
 instead. If the form is unavailable, open a public issue containing no
 security details and ask the maintainer for a private contact channel.
 

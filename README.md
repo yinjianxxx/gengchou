@@ -12,8 +12,8 @@
 <sub>AI quota monitor for the Windows taskbar</sub>
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![CI](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/yinjianxxx/gengchou)](https://github.com/yinjianxxx/gengchou/releases/latest)
+[![CI](https://github.com/ynjmxn/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/ynjmxn/gengchou/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <img src=".github/readme/detail-popup-en-dark.png" alt="Detail popup in dark theme: Claude Code flagged near its limit with the 7-day window at 92% and its reset time highlighted; Codex normal at 51%; Antigravity idle" width="400"> <img src=".github/readme/detail-popup-en-light.png" alt="The same detail popup in light theme" width="400">
@@ -84,7 +84,7 @@ Installation options, in recommended order:
 
 1. **Portable ZIP (recommended).** Download
    `gengchou-windows-x64.zip` from the
-   [latest release](https://github.com/yinjianxxx/gengchou/releases/latest),
+   [latest release](https://github.com/ynjmxn/gengchou/releases/latest),
    extract it to any folder you can write to, and run `gengchou.exe`. The
    bundle includes both READMEs and the retained license and attribution
    notices.
@@ -95,7 +95,7 @@ Installation options, in recommended order:
 3. **WinGet (when available).** The package uses this identifier:
 
    ```powershell
-   winget install --id yinjianxxx.Gengchou --exact
+   winget install --id ynjmxn.Gengchou --exact
    ```
 
    If WinGet cannot find it yet, use the ZIP or EXE instead.
@@ -112,7 +112,7 @@ original project, not this app.
 <summary><b>Build from source</b> (Windows 10/11, stable Rust)</summary>
 
 ```powershell
-git clone https://github.com/yinjianxxx/gengchou.git
+git clone https://github.com/ynjmxn/gengchou.git
 cd gengchou
 cargo build --release --locked
 .\target\release\gengchou.exe

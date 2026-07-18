@@ -110,7 +110,7 @@ with a short note in the release runbook.
   `gengchou-windows-x64.zip`, three compliance files, and `SHA256SUMS`. The
   manifest must cover all five payload assets, and the EXE and ZIP must both
   have build provenance attestations.
-- Verify the WinGet path with `yinjianxxx.Gengchou` on an installed build when
+- Verify the WinGet path with `ynjmxn.Gengchou` on an installed build when
   the new package update exists; do not test the unpublished former ID.
 - Confirm the draft release re-download passes `SHA256SUMS` and GitHub
   attestation verification before the workflow publishes it.
@@ -125,7 +125,7 @@ with a short note in the release runbook.
 - Publish and re-download the final GitHub release before preparing any WinGet
   manifest; use the public `gengchou-windows-x64.zip` URL and its released
   SHA-256, never a draft or local build.
-- Submit the first `yinjianxxx.Gengchou` package only after the matching GitHub
+- Submit the first `ynjmxn.Gengchou` package only after the matching GitHub
   release is public, then wait for the WinGet validation pipeline and review.
 - After the WinGet pull request is merged, install the public package on a
   clean Windows profile, confirm the installed command is `gengchou`, and test

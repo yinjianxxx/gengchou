@@ -43,7 +43,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 const FILE_ATTRIBUTE_REPARSE_POINT_VALUE: u32 = 0x0000_0400;
 // Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "yinjianxxx.Gengchou";
+const WINGET_PACKAGE_ID: &str = "ynjmxn.Gengchou";
 
 static UPDATE_READY_CONFIRMED: AtomicBool = AtomicBool::new(false);
 

@@ -12,8 +12,8 @@
 <sub>Windows 任务栏 AI 配额监控工具</sub>
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![CI](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/yinjianxxx/gengchou/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/yinjianxxx/gengchou)](https://github.com/yinjianxxx/gengchou/releases/latest)
+[![CI](https://github.com/ynjmxn/gengchou/actions/workflows/ci.yml/badge.svg)](https://github.com/ynjmxn/gengchou/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ynjmxn/gengchou)](https://github.com/ynjmxn/gengchou/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <img src=".github/readme/detail-popup-zh-dark.png" alt="深色主题详情弹窗：Claude Code 的 7 天窗口达 92% 被标记接近上限并高亮重置时间；Codex 51% 正常；Antigravity 空闲" width="400"> <img src=".github/readme/detail-popup-zh-light.png" alt="同一详情弹窗的浅色主题" width="400">
@@ -55,14 +55,14 @@
 
 推荐按以下顺序选择安装方式：
 
-1. **便携 ZIP（推荐）。** 从[最新 Release](https://github.com/yinjianxxx/gengchou/releases/latest) 下载 `gengchou-windows-x64.zip`，解压到任意可写目录后运行 `gengchou.exe`。压缩包还包含中英文 README、许可证和归属声明。
+1. **便携 ZIP（推荐）。** 从[最新 Release](https://github.com/ynjmxn/gengchou/releases/latest) 下载 `gengchou-windows-x64.zip`，解压到任意可写目录后运行 `gengchou.exe`。压缩包还包含中英文 README、许可证和归属声明。
 
 2. **独立 EXE。** 如需单文件下载，可从同一 Release 获取 `gengchou.exe`，放在任意可写目录直接运行。
 
 3. **WinGet（上架后可用）。** 软件包使用以下标识：
 
    ```powershell
-   winget install --id yinjianxxx.Gengchou --exact
+   winget install --id ynjmxn.Gengchou --exact
    ```
 
    如果 WinGet 暂时找不到该软件包，请改用 ZIP 或 EXE。
@@ -75,7 +75,7 @@
 <summary><b>从源码构建</b>（Windows 10/11，稳定版 Rust）</summary>
 
 ```powershell
-git clone https://github.com/yinjianxxx/gengchou.git
+git clone https://github.com/ynjmxn/gengchou.git
 cd gengchou
 cargo build --release --locked
 .\target\release\gengchou.exe
